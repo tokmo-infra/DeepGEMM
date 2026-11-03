@@ -55,6 +55,9 @@ if os.getenv('DG_ENABLE_NVSHMEM', '0') == '1':
     if not any('nvshmemx_collective_launch_attr(' in p.read_text(errors='ignore')
                for p in (nvshmem_home / 'include').rglob('*.h')):
         raise RuntimeError('NVSHMEM must provide nvshmemx_collective_launch_attr for 2-SM clusters')
+    if not any('nvshmemx_quiet_warp(' in p.read_text(errors='ignore')
+               for p in (nvshmem_home / 'include').rglob('*.h')):
+        raise RuntimeError('NVSHMEM must provide nvshmemx_quiet_warp for collective RMA completion')
     cxx_flags += [
         '-DDG_ENABLE_NVSHMEM=1',
         f'-DDG_NVSHMEM_INCLUDE_DIR="{nvshmem_home / "include"}"',

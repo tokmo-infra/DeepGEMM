@@ -24,20 +24,26 @@ RDMA transport and HCA selection before starting workers.
    for every invocation. CUDA Graph replays can reuse `%gridid`, so it cannot
    identify a fresh RDMA return. One dispatch thread advances the counter before
    the existing grid barrier publishes it to the other threads.
-2. Dispatch issuers drain their NVSHMEM operations, synchronize locally, and one
-   thread participates in `nvshmem_barrier_all`. Remote input slabs (FP8 tokens,
-   packed scales, top-k IDs and weights) are then pulled into local staging.
+2. CTA 0's dispatch warps drain their NVSHMEM operations collectively, synchronize
+   locally, and one thread participates in `nvshmem_barrier_all`. Remote inputs
+   (FP8 tokens, packed scales, top-k IDs and weights) are then pulled into local
+   staging. Only the live token prefixes are transferred; capacity-based offsets
+   remain unchanged. An empty peer issues no input transfer.
    Counts from remote sources are accumulated **locally**, preserving the
    scheduler's `num_sms * num_ranks` high-word readiness condition. NIC atomics
    never contend with GPU atomics on the expert sum. A final local grid sync
    publishes the staged inputs before the existing ring-buffer pipeline runs.
 3. Remote GEMM2 stores write local staging in `[peer][top-k][token][hidden]`
-   order. After the epilogue grid sync, consecutive tokens owned by this rank in
-   each top-k slot are sent in contiguous runs. Other ranks' slots are untouched;
-   shared-expert output stays local. No 16-byte lane store becomes an RDMA call.
-4. Each peer issuer calls `quiet`, publishes an NVSHMEM ready signal tagged with
-   the **destination** buffer epoch, and drains it. The destination uses NVSHMEM
-   `test` before reading the payload, followed by an async-proxy fence for TMA.
+   order. After the epilogue grid sync, the whole epilogue CTA distributes
+   independent owned rows across its threads. Each RDMA operation transfers a
+   complete hidden row, avoiding a serial row loop in one lane per destination.
+   Other ranks' slots are untouched; shared-expert output stays local.
+4. Each issuing warp calls collective `quiet`, then a CTA rendezvous permits
+   peer threads to publish an NVSHMEM ready signal tagged with the **destination**
+   buffer epoch and drain it. One destination thread uses NVSHMEM `test_all` on
+   all peers' readiness signals, and an epilogue grid sync distributes completion
+   to combine readers. TMA reads retain the async-proxy fence. Per-token polling
+   therefore need not repeat the NVSHMEM target-consistency operation.
    Send-buffer consumption, target ordering, and ring consumer credit remain
    separate events.
 5. The cleanup barrier follows all outgoing returns. Stream serialization and
@@ -46,8 +52,9 @@ RDMA transport and HCA selection before starting workers.
    modules intentionally live for the worker process lifetime; reusing the same
    `SymmBuffer` is required to bound memory use.
 
-The native path keeps its original barriers and direct operations. RDMA adds
-full-capacity input and output staging as a deliberately simple first baseline.
+The native path keeps its original barriers and direct operations. RDMA reserves
+full-capacity input and output staging, while transferring only valid inputs
+and owned return rows.
 With `N` ranks, `M` token capacity, `E` experts, hidden size `H`, and top-k `K`,
 extra bytes are approximately `1024 + 4*E*M + N*M*(H + H/32 + 12*K + 2*K*H)`
 plus alignment. Slots for directly accessible peers are also reserved in this
@@ -61,7 +68,8 @@ Use the exact DeepGEMM branch paired with the vLLM branch. Requirements:
 
 - Linux, SM100-family CUDA devices, CUDA >=12.9, and the baseline's PyTorch ABI.
 - NVSHMEM headers and `libnvshmem_host.so` / `libnvshmem_device.a` providing
-  `nvshmemx_collective_launch_attr`. API source inspected during implementation:
+  `nvshmemx_collective_launch_attr` and `nvshmemx_quiet_warp`.
+  API source inspected during implementation:
   NVIDIA/nvshmem commit `eaf955fd938eefbdb17ec607ee11b71493f95959`.
   Older installations without that API are rejected by setup.
 - Build with `DG_ENABLE_NVSHMEM=1`, `DG_FORCE_BUILD=1`, and `NVSHMEM_HOME`.
@@ -181,32 +189,79 @@ per rank so different transports can verify an identical workload. Report the
 median of each batch's maximum rank-average latency. These are synthetic MoE
 layer measurements, not serving throughput or request latency percentiles.
 
-NVSHMEM IBGDA can be enabled with `NVSHMEM_IB_ENABLE_IBGDA=1`. Inspect the actual
-NIC handler in `NVSHMEM_DEBUG=INFO` logs: with the tested driver/container
-configuration, even a `gpu` handler request fell back to CPU host memory after
-`cudaHostRegister(IoMemory)` returned error 800. Adding `SYS_RAWIO` did not
-change that. Do not report these runs as pure GPU doorbell measurements.
+NVSHMEM IBGDA can be enabled with `NVSHMEM_IB_ENABLE_IBGDA=1`. Initially,
+`cudaHostRegister(IoMemory)` returned error 800 and the requested GPU NIC handler
+fell back to CPU host memory. Adding `SYS_RAWIO` did not resolve it. The tested
+NVIDIA driver checks `CAP_SYS_ADMIN` for administrator access; adding that
+capability to the isolated test containers resolved GPU NIC buffer mapping on
+both hosts, without reloading or reconfiguring the host drivers. Follow the
+deployment's approved driver/container configuration for peer mappings.
+Set `NVSHMEM_IBGDA_NIC_HANDLER=gpu` and `NVSHMEM_DEBUG=INFO`, then verify
+`NIC handler will be GPU` in every worker's log. The requested handler alone
+does not prevent fallback in this NVSHMEM build.
+
+Use a GPU-local HCA per worker, and match the fabric's traffic class. These
+tests used `NVSHMEM_IB_GID_INDEX=3`, `NVSHMEM_IB_TRAFFIC_CLASS=106`,
+`NVSHMEM_ENABLE_NIC_PE_MAPPING=1`, `NVSHMEM_MAX_NICS_PER_PE=1`, and explicit
+`NVSHMEM_HCA_PE_MAPPING`. Do not also set `NVSHMEM_HCA_LIST` when using that
+mapping. Each mapping entry is `HCA:port:local-worker-count`; for example:
+
+```sh
+# Host 55, local GPUs 0 through 3:
+export NVSHMEM_HCA_PE_MAPPING=mlx5_0:1:1,mlx5_2:1:1,mlx5_6:1:1,mlx5_8:1:1
+# Host 90 instead uses mlx5_0, mlx5_6, mlx5_8, mlx5_10, each with :1:1.
+```
+
+These names and traffic class are specific to the measured fabric. Keep the
+tested IBGDA defaults (two RC QPs per peer and request batch 32); increasing RC
+QPs to eight and reducing the batch to one regressed this workload. NIC PFC,
+trust mode, host sysctls and driver settings were not changed by the tests.
 
 Measured on 2026-11-04 with B300, CUDA 13.0.88, PyTorch 2.13.0+cu130 and the
 NVSHMEM revision above. All cases use EP8, 384 experts, top-k 6, hidden 5120,
 intermediate 2304, one shared expert and SwiGLU clamp 10. Requested capacity 512
-aligns to 1920. Cross-node cases use four GPUs and one shared RoCE HCA per node;
-native and NVSHMEM local controls use eight GPUs on one node. The two nodes use
-drivers 580.105.08 and 580.196.07. Median layer latency in milliseconds:
+aligns to 1920. Native and NVSHMEM local controls use eight GPUs on one node.
+The two nodes use drivers 580.105.08 and 580.196.07. The initial baseline used
+four GPUs and one shared RoCE HCA per node. Its median layer latency in
+milliseconds was:
 
 | Tokens per rank | Native NVLink | Local NVSHMEM | Cross-node IBRC | Cross-node IBGDA, CPU handler |
 | ---: | ---: | ---: | ---: | ---: |
 | 128 | 0.191 | 0.226 | 84.277 | 11.719 |
 | 512 | 0.225 | 0.258 | 217.581 | 16.398 |
 
-All eight cases passed exact checks and used matching per-rank input hashes.
-Both IBGDA cases also passed 100 changing-route replays. CPU-assisted IBGDA was
-7.2–13.3 times faster than IBRC here, but remained 61.5–73.0 times slower than
-native NVLink. Its batch-average ranges were 9.206–15.102 ms and 15.520–25.122 ms.
-These measurements do not establish a cross-node deployment benefit or measure
-pure GPU NIC progress. Full-capacity prefetch, return fragmentation and barriers
-remain optimization candidates, not profiled attributions. Additional RDMA
-staging was 1,028,875,264 bytes per rank, beyond the 355,896,704-byte native buffer.
+All eight baseline cases passed exact checks and used matching per-rank input
+hashes. Both IBGDA cases also passed 100 changing-route replays. Their
+batch-average ranges were 9.206–15.102 ms and 15.520–25.122 ms.
+
+After live-prefix prefetch, parallel return submission, scoped collective
+completion, one target-consistency check per layer, and the runtime corrections
+above, the cross-node results were:
+
+| Tokens per rank | GPU-handler IBGDA median ms | Min–max ms | Speedup over initial IBGDA |
+| ---: | ---: | ---: | ---: |
+| 128 | 1.072 | 1.064–1.077 | 10.9x |
+| 512 | 2.800 | 2.736–2.839 | 5.9x |
+
+Both cases passed 100 changing-route replays and exact checks after every timed
+batch, with input hashes matching the baseline. The final kernel also passed
+100 replays each for no shared expert, shared plus an empty rank and 50% masked
+routes, uneven token counts, and an IBRC fallback case. All eight IBGDA workers
+used the GPU NIC handler. The speedups above include both kernel and runtime
+changes; switching only the NIC handler left the 128-token median at 11.730 ms.
+An additional A/B run of the original kernel with the final GPU handler, HCA
+mapping and traffic class measured 6.480 ms (6.479–6.496 ms) at 128 tokens/rank,
+versus 1.072 ms with the final kernel: a 6.0x kernel speedup under the same
+runtime configuration and input hashes.
+The smaller batch now transfers 10,960,896 input bytes per node instead of
+164,413,440 (layout-derived, excluding routes and returns). Additional RDMA
+staging remains 1,028,875,264 bytes per rank, beyond the 355,896,704-byte native
+buffer. These results still do not establish a full-model deployment benefit.
+
+Final single-node EP8 controls also passed 20 changing-route replays per case
+and the same seven timed-batch checks. Native NVLink measured 0.192/0.225 ms
+and local NVSHMEM measured 0.217/0.249 ms at 128/512 tokens per rank. The final
+cross-node path remains about 5.6/12.4 times slower than native NVLink here.
 
 Example per-node test command (existing harness uses `WORLD_SIZE` as the number
 of nodes and `RANK` as the node index; this command spawns eight local workers):

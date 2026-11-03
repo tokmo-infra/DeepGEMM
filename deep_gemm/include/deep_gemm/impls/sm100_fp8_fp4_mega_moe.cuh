@@ -1430,8 +1430,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         );
 
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
-        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
-            transport.return_and_signal(epilogue_thread_idx, peer_grid_idx);
+        if (sm_idx == 0)
+            transport.template return_and_signal<kNumEpilogueThreads>(
+                epilogue_thread_idx, peer_grid_idx,
+                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+            );
+
+        transport.template finish_returns<kNumSMs, kEpilogueGridSyncIndex>(
+            workspace, sm_idx, epilogue_thread_idx,
+            [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+        );
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);

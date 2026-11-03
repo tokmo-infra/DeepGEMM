@@ -31,7 +31,9 @@ class SymmBuffer:
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu',
-                 base: Optional['SymmBuffer'] = None):
+                 base: Optional['SymmBuffer'] = None,
+                 transport: str = 'nvlink',
+                 bootstrap_group: dist.ProcessGroup | None = None):
         # Align token count
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -46,6 +48,12 @@ class SymmBuffer:
         self.num_shared_experts = num_shared_experts
         self.mma_type = mma_type
         self.activation = activation
+        if transport not in ('nvlink', 'nvshmem'):
+            raise ValueError(f'Unknown MegaMoE transport: {transport}')
+        self.transport = transport
+        self.rdma_buffer = None
+        if transport == 'nvshmem' and base is not None:
+            raise ValueError('RDMA base-buffer aliasing is not supported; reuse the same SymmBuffer')
 
         # Allocate or reuse a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
@@ -55,7 +63,15 @@ class SymmBuffer:
             mma_type, activation,
             num_shared_experts
         )
-        if base is None:
+        if transport == 'nvshmem':
+            from .rdma import allocate_buffers
+            self.buffer, self.handle, self.rdma_buffer = allocate_buffers(
+                group, bootstrap_group,
+                {'experts': num_experts, 'tokens': num_max_tokens_per_rank,
+                 'topk': num_topk, 'hidden': hidden, 'intermediate_hidden': intermediate_hidden,
+                 'shared': num_shared_experts, 'mma_type': mma_type, 'activation': activation},
+                num_bytes)
+        elif base is None:
             allocator = torch if group.size() == 1 else symm_mem
             self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
             self.handle = (
@@ -67,6 +83,8 @@ class SymmBuffer:
             self.group.barrier()
             torch.cuda.synchronize()
         else:
+            if base.transport != transport:
+                raise ValueError('Cannot reuse a buffer from a different transport')
             assert base.buffer is not None and base.handle is not None and base.group is group, \
                 'Cannot reuse an invalid symmetric buffer'
             assert num_bytes <= base.buffer.nbytes, \
@@ -84,6 +102,8 @@ class SymmBuffer:
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
 
     def destroy(self):
+        # NVSHMEM storage is process-scoped; captured graphs may still refer to it.
+        self.rdma_buffer = None
         self.handle = None
         self.buffer = None
         self.group = None
@@ -99,7 +119,9 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 transport: str = 'nvlink',
+                                 bootstrap_group: dist.ProcessGroup | None = None) -> SymmBuffer:
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -113,7 +135,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts,
-        mma_type=mma_type, activation=activation
+        mma_type=mma_type, activation=activation,
+        transport=transport, bootstrap_group=bootstrap_group
     )
 
 
@@ -199,7 +222,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         recipe,
         activation, activation_clamp,
         fast_math,
-        activation_alpha, activation_beta
+        activation_alpha, activation_beta,
+        sym_buffer.rdma_buffer
     )
 
 def fp4_fp4_mega_moe(y: torch.Tensor,
@@ -231,6 +255,8 @@ def fp4_fp4_mega_moe(y: torch.Tensor,
     gain-centered by the caller. Tensor metadata cannot verify packed contents
     or gate/up ordering. Native layout retains optional post-expert norm.
     """
+    if sym_buffer.rdma_buffer is not None:
+        raise ValueError('RDMA supports only fp8_fp4_mega_moe with SwiGLU')
     if weight_layout not in ("native", "trtllm"):
         raise ValueError(f"Unsupported weight layout: {weight_layout}")
     # NVFP4 x NVFP4 fused MoE: weights and activations are packed E2M1 with
@@ -289,6 +315,8 @@ def bf16_mega_moe(y: torch.Tensor,
                   activation_beta: float = 0.0,
                   post_expert_norm_gamma: Optional[torch.Tensor] = None,
                   post_expert_norm_eps: float = 0.0):
+    if sym_buffer.rdma_buffer is not None:
+        raise ValueError('RDMA supports only fp8_fp4_mega_moe with SwiGLU')
     assert activation in ('swiglu', 'swiglustep'), \
         f'BF16 Mega MoE supports `swiglu` or `swiglustep`, got `{activation}`'
     _C.bf16_mega_moe(

@@ -43,6 +43,27 @@ build_include_dirs = [
 ]
 build_libraries = ['cudart']
 build_library_dirs = [f'{CUDA_HOME}/lib64']
+if os.getenv('DG_ENABLE_NVSHMEM', '0') == '1':
+    nvshmem_home = Path(os.environ['NVSHMEM_HOME']).resolve()
+    nvshmem_lib = next((p for p in (nvshmem_home / 'lib', nvshmem_home / 'lib64')
+                       if (p / 'libnvshmem_device.a').is_file()), None)
+    if nvshmem_lib is None:
+        raise RuntimeError('NVSHMEM_HOME must contain libnvshmem_device.a')
+    launch_header = nvshmem_home / 'include' / 'nvshmemx.h'
+    if not launch_header.is_file():
+        raise RuntimeError('NVSHMEM_HOME must contain include/nvshmemx.h')
+    if not any('nvshmemx_collective_launch_attr(' in p.read_text(errors='ignore')
+               for p in (nvshmem_home / 'include').rglob('*.h')):
+        raise RuntimeError('NVSHMEM must provide nvshmemx_collective_launch_attr for 2-SM clusters')
+    cxx_flags += [
+        '-DDG_ENABLE_NVSHMEM=1',
+        f'-DDG_NVSHMEM_INCLUDE_DIR="{nvshmem_home / "include"}"',
+        f'-DDG_NVSHMEM_DEVICE_LIB="{nvshmem_lib / "libnvshmem_device.a"}"',
+    ]
+    build_include_dirs.append(str(nvshmem_home / 'include'))
+    build_library_dirs.append(str(nvshmem_lib))
+    build_library_dirs.append(f'{CUDA_HOME}/lib64/stubs')
+    build_libraries += ['nvshmem_host', 'cuda']
 third_party_include_dirs = [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
@@ -105,6 +126,7 @@ def get_ext_modules():
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
                           library_dirs=build_library_dirs,
+                          runtime_library_dirs=[str(nvshmem_lib)] if os.getenv('DG_ENABLE_NVSHMEM', '0') == '1' else [],
                           extra_compile_args=cxx_flags,
                           py_limited_api=True)]
 
@@ -176,7 +198,7 @@ class CustomBuildPy(build_py):
 
 class CachedWheelsCommand(_bdist_wheel):
     def run(self):
-        if DG_FORCE_BUILD or DG_USE_LOCAL_VERSION:
+        if DG_FORCE_BUILD or DG_USE_LOCAL_VERSION or os.getenv('DG_ENABLE_NVSHMEM', '0') == '1':
             return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()

@@ -11,6 +11,7 @@ struct SymBuffer {
     int64_t base;
     int64_t offsets[kNumMaxRanks];
     uint32_t rank_idx;
+    uint8_t mapped[kNumMaxRanks];
 
     DG_STATIC_ASSERT(kNumRanks <= kNumMaxRanks, "Too many ranks");
 
@@ -20,11 +21,15 @@ struct SymBuffer {
     explicit SymBuffer(const Container& c, const uint32_t& rank_idx): rank_idx(rank_idx) {
         const auto size = static_cast<uint32_t>(c.size());
         base = c[rank_idx];
-        for (uint32_t i = 0; i < kNumMaxRanks; ++ i)
+        for (uint32_t i = 0; i < kNumMaxRanks; ++ i) {
             offsets[i] = i < size ? (c[i] - base) : 0;
+            mapped[i] = i < size and c[i] != 0;
+        }
     }
 
 #if defined(__CUDA_ARCH__) or defined(__CLION_IDE__)
+    CUTLASS_DEVICE bool is_mapped(uint32_t peer) const { return mapped[peer]; }
+
     template <typename ptr_t = void*>
     CUTLASS_DEVICE ptr_t get_base_ptr() const {
         return reinterpret_cast<ptr_t>(base);
@@ -32,6 +37,7 @@ struct SymBuffer {
 
     template <typename ptr_t>
     CUTLASS_DEVICE ptr_t map(const ptr_t& ptr, const uint32_t& dst_rank_idx) const {
+        DG_DEVICE_ASSERT(is_mapped(dst_rank_idx));
         if constexpr (kNumRanks == 1)
             return ptr;
 

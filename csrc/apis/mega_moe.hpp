@@ -313,7 +313,8 @@ static void fp8_fp4_mega_moe(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
     const float& activation_alpha,
-    const float& activation_beta
+    const float& activation_beta,
+    const std::optional<torch::stable::Tensor>& rdma_buffer
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -405,6 +406,19 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(torch_compat::nbytes(sym_buffer) >= static_cast<size_t>(layout_info.num_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
+    if (rdma_buffer.has_value()) {
+        DG_HOST_ASSERT(arch_major == 10 and activation == "swiglu" and weight_dtype == kPackedFP4);
+        DG_HOST_ASSERT(not deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"));
+#ifdef DG_ENABLE_NVSHMEM
+        rdma::validate(sym_buffer, *rdma_buffer, sym_buffer_ptrs, rank_idx,
+            layout::MegaMoERdmaBuffer(nullptr, num_ranks, num_experts, num_max_tokens_per_rank, hidden, num_topk).get_num_bytes());
+#else
+        DG_HOST_UNREACHABLE("Rebuild DeepGEMM with DG_ENABLE_NVSHMEM=1");
+#endif
+    } else {
+        DG_HOST_ASSERT(std::all_of(sym_buffer_ptrs.begin(), sym_buffer_ptrs.end(), [](auto p) { return p != 0; }));
+    }
+
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights,
                 shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
@@ -438,7 +452,8 @@ static void fp8_fp4_mega_moe(
                    activation_alpha, activation_beta, fast_math);
         } else {
             launch(sm100_fp8_fp4_mega_moe,
-                   activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math);
+                   activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math,
+                   rdma_buffer.has_value() ? rdma_buffer->mutable_data_ptr() : nullptr);
         }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -837,7 +852,8 @@ static void fp8_fp4_mega_moe(
     const std::optional<double>& activation_clamp_opt,
     const bool& fast_math,
     const double& activation_alpha,
-    const double& activation_beta) {
+    const double& activation_beta,
+    const std::optional<torch::stable::Tensor>& rdma_buffer) {
     mega::fp8_fp4_mega_moe(
         y, {l1_weights_tuple, l1_weights_tuple_sf}, {l2_weights_tuple, l2_weights_tuple_sf},
         make_optional_tensor_pair(shared_l1_weights_tuple_opt, shared_l1_weights_tuple_opt_sf),
@@ -846,7 +862,7 @@ static void fp8_fp4_mega_moe(
         mega::checked_int(rank_idx), mega::checked_int(num_max_tokens_per_rank),
         mega::checked_int(num_experts), mega::checked_int(num_topk), checked_recipe(recipe),
         activation, activation_clamp_opt, fast_math,
-        static_cast<float>(activation_alpha), static_cast<float>(activation_beta));
+        static_cast<float>(activation_alpha), static_cast<float>(activation_beta), rdma_buffer);
 }
 
 static void bf16_mega_moe(
@@ -941,7 +957,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
     m.def("get_symm_buffer_size_for_mega_moe(int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, str mma_type, str activation, int num_shared_experts) -> (int, int[])");
     m.def("_slice_symm_buffer_for_mega_moe(Tensor(a) buffer, int[] layout_info) -> (Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a))");
 
-    m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta) -> ()");
+    m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor(d!)? rdma_buffer=None) -> ()");
     m.def("bf16_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
     m.def("fp4_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor? x_bf16_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, Tensor? l1_alphas_opt, Tensor? l2_alphas_opt, Tensor? a2_scales_opt, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
     m.def("fp4_fp4_mega_moe_trtllm(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor? x_bf16_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, Tensor? l1_alphas_opt, Tensor? l2_alphas_opt, Tensor? a2_scales_opt, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");

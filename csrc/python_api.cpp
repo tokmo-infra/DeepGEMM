@@ -17,6 +17,7 @@
 #include "apis/layout.hpp"
 #include "apis/locality_domain.hpp"
 #include "apis/mega_moe.hpp"
+#include "apis/mega_moe_rdma.hpp"
 #include "apis/nvfp4_mega_moe.hpp"
 #include "apis/mega_mhc.hpp"
 #include "apis/mega_gate.hpp"

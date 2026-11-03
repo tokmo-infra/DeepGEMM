@@ -8,6 +8,7 @@
 #include <deep_gemm/layout/sym_buffer.cuh>
 
 #include "../../runtime/runtime.hpp"
+#include "../../runtime/mega_moe_rdma.hpp"
 #include "../../utils/exception.hpp"
 #include "../heuristics/mega_moe.hpp"
 #include "runtime_utils.hpp"
@@ -36,7 +37,8 @@ static void sm100_fp8_fp4_mega_moe(
     const bool& clamp_after_silu,
     const float& activation_alpha,
     const float& activation_beta,
-    const bool& fast_math
+    const bool& fast_math,
+    void* rdma_buffer = nullptr
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -150,7 +152,7 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_sms = get_num_sms_for_mega_moe();
 
     // Compile
-    const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", std::format(R"(
+    const auto kernel = rdma::compile(std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -196,20 +198,22 @@ static void __instantiate_kernel() {{
         to_string(activation_alpha),
         to_string(activation_beta),
         fast_math ? "true" : "false",
-        to_string(l1_weights.scalar_type())));
+        to_string(l1_weights.scalar_type())), rdma_buffer != nullptr);
 
     // Launch
-    jit->launch(
-        kernel, {
+    rdma::launch(
+        rdma_buffer != nullptr, kernel, {
             .num_smem_bytes = config.smem_size,
             .grid_dim = dim3(num_sms, 1, 1),
             .block_dim = dim3(config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads, 1, 1),
             .cluster_dim = dim3(2, 1, 1),
+            .enable_pdl = rdma_buffer == nullptr and jit->default_launch_options.enable_pdl.value_or(false),
         },
         y.mutable_data_ptr(),
         cumulative_local_expert_recv_stats_ptr,
         num_tokens,
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+        rdma_buffer,
         tensor_map_l1_acts,
         tensor_map_l1_acts_sf,
         tensor_map_l1_weights,

@@ -95,6 +95,7 @@ from .mega import (
     bf16_mega_moe,
 )
 from .mega.nvfp4 import NVFP4SymmBuffer, nvfp4_mega_moe
+from .mega.rdma import get_mega_moe_rdma_abi_version as get_mega_moe_rdma_abi_version
 from ._C import get_block_m_for_nvfp4_mega_moe
 
 # Epilogue classes

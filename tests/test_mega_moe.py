@@ -77,6 +77,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     assert args.activation != 'situ' or args.mma_type != 'bf16xbf16', \
         'SiTU is only supported by the FP8/FP4 Mega MoE kernel path'
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    bootstrap_group = dist.new_group(backend='gloo') if args.transport == 'nvshmem' else None
     deep_gemm.use_deterministic_algorithms(True)
     torch.manual_seed(rank_idx)
     random.seed(rank_idx)
@@ -104,7 +105,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         hidden, intermediate_hidden,
         num_shared_experts=num_shared_experts,
         mma_type=args.mma_type,
-        activation=args.activation
+        activation=args.activation,
+        transport=args.transport,
+        bootstrap_group=bootstrap_group
     )
 
     # Cast routed weights into FP4 or FP8
@@ -258,6 +261,75 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         # Destroy and exit
         dist.barrier()
         buffer.destroy()
+        dist.destroy_process_group()
+        return
+
+    if args.transport == 'nvshmem':
+        # Compare against the unmodified EP1 compute/communication path with
+        # the same quantized weights, then change routing on every graph replay.
+        # This branch never initializes DeepEP (a second NVSHMEM world).
+        assert args.mma_type == 'fp8xfp4' and args.activation == 'swiglu'
+        assert not args.post_expert_norm
+        assert num_experts <= 512, 'EP1 reference requires at most 512 experts'
+        create_inputs()
+        def gather_weights(t):
+            gathered = [torch.empty_like(t.contiguous()) for _ in range(num_ranks)]
+            dist.all_gather(gathered, t.contiguous(), group=group)
+            full = torch.empty_strided((num_experts, *t.shape[1:]), t.stride(),
+                                       dtype=t.dtype, device=t.device)
+            return full.copy_(torch.cat(gathered))
+
+        ref_l1 = tuple(gather_weights(t) for t in l1_weights)
+        ref_l2 = tuple(gather_weights(t) for t in l2_weights)
+        ref_l1, ref_l2 = deep_gemm.transform_weights_for_mega_moe(ref_l1, ref_l2)
+        self_group = dist.new_group([rank_idx], backend='gloo', use_local_synchronization=True)
+        reference = deep_gemm.SymmBuffer(
+            self_group, num_experts, num_max_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden, num_shared_experts=num_shared_experts)
+
+        def expected_output():
+            reference.x[:num_tokens].copy_(x[0])
+            reference.x_sf[:num_tokens].copy_(x[1])
+            reference.topk_idx[:num_tokens].copy_(topk_idx)
+            reference.topk_weights[:num_tokens].copy_(topk_weights)
+            if num_shared_experts:
+                block_m = deep_gemm.get_block_m_for_mega_moe(
+                    1, num_experts, reference.num_max_tokens_per_rank, num_tokens, num_topk, 'fp8xfp4')
+                sf = _to_shared_mega_moe_sf_layout(x[1], block_m, reference.shared_l1_acts_sf.shape[0])
+                reference.shared_l1_acts_sf.copy_(sf)
+            result = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+            deep_gemm.fp8_fp4_mega_moe(
+                result, ref_l1, ref_l2, reference,
+                shared_l1_weights=transformed_shared_l1_weights,
+                shared_l2_weights=transformed_shared_l2_weights,
+                activation_clamp=args.activation_clamp, fast_math=bool(args.fast_math),
+                activation_alpha=args.activation_alpha, activation_beta=args.activation_beta)
+            return result
+
+        eager, _ = run_fused()
+        torch.testing.assert_close(eager, expected_output(), rtol=0, atol=0)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replay_y, replay_stats = run_fused()
+        for _ in range(args.num_correctness_tests or 20):
+            topk_idx.copy_(torch.where(topk_idx < 0, topk_idx, (topk_idx + 1) % num_experts))
+            x[0].copy_(x[0].roll(1, dims=0))
+            x[1].copy_(x[1].roll(1, dims=0))
+            if num_shared_experts:
+                block_m = deep_gemm.get_block_m_for_mega_moe(
+                    num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, 'fp8xfp4')
+                shared_l1_x_sf.copy_(_to_shared_mega_moe_sf_layout(x[1], block_m, shared_l1_x_sf.shape[0]))
+            graph.replay()
+            torch.testing.assert_close(replay_y, expected_output(), rtol=0, atol=0)
+            all_routes = uneven_all_gather(topk_idx, group=group)
+            counts = torch.bincount(all_routes[all_routes >= 0], minlength=num_experts)
+            expected_stats = initial_cumulative_local_expert_recv_stats_fused + counts[
+                rank_idx * num_experts_per_rank:(rank_idx + 1) * num_experts_per_rank]
+            torch.testing.assert_close(replay_stats, expected_stats.to(replay_stats.dtype), rtol=0, atol=0)
+        dist_print('RDMA eager/graph output and expert-count checks passed', once_in_node=True)
+        dist.barrier()
         dist.destroy_process_group()
         return
 
@@ -529,6 +601,7 @@ if __name__ == '__main__':
     # Resource settings
     parser.add_argument('--ncu-profile-only', action='store_true', help='Only run profiling without correctness test')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
+    parser.add_argument('--transport', choices=('nvlink', 'nvshmem'), default='nvlink')
 
     # Model settings
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=8192, help='Number of maximum tokens per rank')

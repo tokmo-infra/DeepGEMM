@@ -8,6 +8,7 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
+#include <deep_gemm/comm/mega_moe_rdma.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/mma/sm100.cuh>
@@ -61,6 +62,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+                            void* rdma_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
@@ -135,6 +137,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumSharedExperts
     );
     const auto workspace = buffer.workspace;
+    const auto transport = comm::MegaMoETransport<kNumRanks>{
+        sym_buffer, buffer, layout::MegaMoERdmaBuffer(rdma_buffer, kNumRanks, kNumExperts,
+                                                    kNumMaxTokensPerRank, kHidden, kNumTopk)};
 
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
 
@@ -385,11 +390,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Write source indices (~2 us with 512 tokens)
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-            const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
-            const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            transport.route(expert_idx, dst_slot_idx, token_topk_idx);
         });
 
         // Grid sync
@@ -403,33 +405,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
             DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
             if (thread_idx < kNumRanks)
-                *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
+                transport.publish_epoch(thread_idx, ptx::get_grid_idx() + 1, num_tokens);
             __syncwarp();
 
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-                const auto dst_rank_idx = i / kNumExpertsPerRank;
-                const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-                *sym_buffer.map(
-                    workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+                transport.publish_count(i, *workspace.get_expert_send_count_ptr(i));
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Barrier before pulling
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+        transport.template barrier<kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
+            workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
             /* After the NVLink barrier, there is a grid sync */ true
         );
 
+#ifdef DG_MEGAMOE_NVSHMEM
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+#endif
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
@@ -552,7 +549,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
-            const auto src_base_ptr = sym_buffer.map(
+            const auto src_base_ptr = transport.input(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
@@ -579,14 +576,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
 
             // Load the weight first, so that its remote latency overlaps with the SF copy below
-            const auto weight = *sym_buffer.map(
+            const auto weight = *transport.input(
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                 current_rank_in_expert_idx);
 
             // Load and store SF (overlaps with last chunk's TMA load from remote)
             constexpr uint32_t kNumSFUint32 = kHidden / 128;
             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
-            const auto remote_sf_ptr = sym_buffer.map(
+            const auto remote_sf_ptr = transport.input(
                 buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
                 current_rank_in_expert_idx);
             const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
@@ -683,9 +680,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 
         // Wait for all ranks to finish cleaning
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+        transport.template barrier<kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
+            workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
@@ -1363,7 +1360,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const auto dst_ptr = math::advance_ptr<float4>(
                             dst_token.get_base_ptr(),
                             n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        *transport.output(dst_ptr, dst_rank_idx) = packed;
                     }
                 }
 
@@ -1431,7 +1428,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
-            ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
+            transport.return_and_signal(epilogue_thread_idx, peer_grid_idx);
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1452,9 +1449,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or transport.ready(peer_ready_ptr, grid_idx)); },
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
 
+#ifdef DG_MEGAMOE_NVSHMEM
+            asm volatile("fence.proxy.async.global;" ::: "memory");
+#endif
             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
 
             // Move mask and load

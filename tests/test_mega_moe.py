@@ -109,6 +109,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         transport=args.transport,
         bootstrap_group=bootstrap_group
     )
+    if args.transport == 'nvshmem':
+        mapped = [rank for rank, ptr in enumerate(buffer.handle.buffer_ptrs) if ptr]
+        dist_print(f'Transport rank {rank_idx}: directly mapped peers {mapped}')
+        if args.require_remote_peers:
+            assert len(mapped) < num_ranks, 'Test requires at least one peer using remote staging'
+    else:
+        assert not args.require_remote_peers, '--require-remote-peers requires --transport nvshmem'
 
     # Cast routed weights into FP4 or FP8
     def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -315,7 +322,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             replay_y, replay_stats = run_fused()
         for _ in range(args.num_correctness_tests or 20):
             topk_idx.copy_(torch.where(topk_idx < 0, topk_idx, (topk_idx + 1) % num_experts))
-            x[0].copy_(x[0].roll(1, dims=0))
+            # CUDA roll has no float8 implementation; move the quantized bytes.
+            x_bytes = x[0].view(torch.uint8)
+            x_bytes.copy_(x_bytes.roll(1, dims=0))
             x[1].copy_(x[1].roll(1, dims=0))
             if num_shared_experts:
                 block_m = deep_gemm.get_block_m_for_mega_moe(
@@ -602,6 +611,8 @@ if __name__ == '__main__':
     parser.add_argument('--ncu-profile-only', action='store_true', help='Only run profiling without correctness test')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
     parser.add_argument('--transport', choices=('nvlink', 'nvshmem'), default='nvlink')
+    parser.add_argument('--require-remote-peers', action='store_true',
+                        help='Fail unless NVSHMEM exposes at least one peer without a direct mapping')
 
     # Model settings
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=8192, help='Number of maximum tokens per rank')

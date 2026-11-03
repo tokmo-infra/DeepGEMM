@@ -2,6 +2,7 @@
 
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/mega_moe_rdma.cuh>
+#include <deep_gemm/ptx/utils.cuh>
 
 #ifdef DG_MEGAMOE_NVSHMEM
 #include <nvshmem.h>
@@ -16,6 +17,23 @@ struct MegaMoETransport {
     const layout::SymBuffer<kNumRanks>& sym;
     const layout::MegaMoEBuffer& buffer;
     layout::MegaMoERdmaBuffer staging;
+
+    CUTLASS_DEVICE void begin_launch() const {
+#ifdef DG_MEGAMOE_NVSHMEM
+        // CUDA Graph replays can reuse %gridid. Only one thread advances this
+        // process-lifetime buffer counter, before the dispatch grid barrier.
+        ++*staging.launch_epoch();
+        DG_DEVICE_ASSERT(*staging.launch_epoch() != 0);
+#endif
+    }
+
+    CUTLASS_DEVICE uint64_t epoch() const {
+#ifdef DG_MEGAMOE_NVSHMEM
+        return *staging.launch_epoch();
+#else
+        return ptx::get_grid_idx() + 1;
+#endif
+    }
 
     CUTLASS_DEVICE bool remote(uint32_t peer) const {
 #ifdef DG_MEGAMOE_NVSHMEM

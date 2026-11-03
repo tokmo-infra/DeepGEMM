@@ -35,6 +35,7 @@ template <
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
+    bool kHasActivationClamp,
     bool kClampAfterSilu,
     float kActivationAlpha,
     float kActivationBeta,
@@ -350,6 +351,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     if (warp_idx < kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
+        if (sm_idx == 0 and thread_idx == 0)
+            transport.begin_launch();
 
         // Dispatch warps
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
@@ -402,10 +405,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Write expert count
         if (sm_idx == 0) {
-            // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
-            DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
+            // Publish a nonzero launch epoch to every peer for tagging combine readiness.
+            DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the epoch push");
             if (thread_idx < kNumRanks)
-                transport.publish_epoch(thread_idx, ptx::get_grid_idx() + 1, num_tokens);
+                transport.publish_epoch(thread_idx, transport.epoch(), num_tokens);
             __syncwarp();
 
             #pragma unroll
@@ -1113,7 +1116,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             auto bf16_up =   __float22bfloat162_rn(fp32_values[k * 2 + 1]);
 
                             // Clamp
-                            if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
+                            if constexpr (kHasActivationClamp) {
                                 if constexpr (not kClampAfterSilu)
                                     bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
                                 bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
@@ -1137,7 +1140,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             } else {
                                 gated = {gate.x / denom.x, gate.y / denom.y};
                             }
-                            if constexpr (kClampAfterSilu and kActivationClamp != cute::numeric_limits<float>::infinity())
+                            if constexpr (kClampAfterSilu and kHasActivationClamp)
                                 gated = {fminf(gated.x, kActivationClamp), fminf(gated.y, kActivationClamp)};
                             auto up = __bfloat1622float2(bf16_up);
                             if constexpr (kActivationBeta != 0.0f)
@@ -1434,7 +1437,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
-        const auto grid_idx = ptx::get_grid_idx() + 1;
+        const auto grid_idx = transport.epoch();
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;

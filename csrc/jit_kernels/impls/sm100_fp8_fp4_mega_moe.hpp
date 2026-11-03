@@ -1,6 +1,7 @@
 #pragma once
 
 #include <format>
+#include <limits>
 #include <torch/csrc/stable/ops.h>
 #include "../../utils/torch_compat.hpp"
 
@@ -151,6 +152,10 @@ static void sm100_fp8_fp4_mega_moe(
 
     const auto num_sms = get_num_sms_for_mega_moe();
 
+    // RDC host stubs emitted by NVCC cannot represent an infinite float NTTP.
+    // Carry the unclamped mode separately, without approximating infinity.
+    const bool has_activation_clamp = activation_clamp != std::numeric_limits<float>::infinity();
+
     // Compile
     const auto kernel = rdma::compile(std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
@@ -177,6 +182,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -193,7 +199,8 @@ static void __instantiate_kernel() {{
         config.num_bytes_per_pull,
         config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
         num_sms, num_ranks,
-        to_string(activation_clamp),
+        to_string(has_activation_clamp ? activation_clamp : 0.0f),
+        has_activation_clamp ? "true" : "false",
         clamp_after_silu ? "true" : "false",
         to_string(activation_alpha),
         to_string(activation_beta),

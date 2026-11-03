@@ -117,14 +117,18 @@ struct Backend : deep_jit::CUDA {
         };
         std::vector<std::string> args{toolkit.nvcc.string(), "-dc", (dir / "kernel.cu").string(),
                                       "-o", (dir / "kernel.o").string()};
-        const auto flags = options.get_flags();
+        auto flags = options.get_flags();
+        // With -dc, -arch=sm_103f also emits generic compute_103 PTX, which
+        // cannot assemble MegaMoE's family-specific tcgen05 instructions.
+        const auto target = "--generate-code=arch=compute_" + *options.arch + ",code=sm_" + *options.arch;
+        flags.front() = target;
         args.insert(args.end(), flags.begin(), flags.end());
         for (const auto& path : config.include_dirs) {
             args.emplace_back("-I"); args.push_back(path.string());
         }
         const auto compile_log = run(args);
         const auto link_log = run({toolkit.nvcc.string(), "-dlink", "--cubin",
-            "-arch=sm_" + *options.arch, (dir / "kernel.o").string(), DG_NVSHMEM_DEVICE_LIB,
+            target, (dir / "kernel.o").string(), DG_NVSHMEM_DEVICE_LIB,
             "-o", (dir / "kernel.cubin").string()});
         deep_jit::write_file_sync(dir / "build.log", commands + compile_log + link_log);
         deep_jit::write_file_sync(dir / "meta.json", deep_jit::json(deep_jit::json::object_t{
@@ -141,7 +145,7 @@ inline std::shared_ptr<deep_jit::cuda::Kernel> compile(const std::string& source
     static auto* runtime = [] {
         auto config = jit->config;
         config.include_dirs.emplace_back(DG_NVSHMEM_INCLUDE_DIR);
-        config.extra_signature += "-megamoe-rdma-v1-" + deep_jit::hash::get_hex_digest(
+        config.extra_signature += "-megamoe-rdma-v2-" + deep_jit::hash::get_hex_digest(
             deep_jit::read(DG_NVSHMEM_DEVICE_LIB));
         return new deep_jit::Runtime<Backend>(config);
     }();

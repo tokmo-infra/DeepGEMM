@@ -40,6 +40,9 @@ struct MegaMoERdmaBuffer {
     DG_RDMA_HD uint64_t* peer_tokens(uint32_t peer) const {
         return reinterpret_cast<uint64_t*>(base) + peer;
     }
+    DG_RDMA_HD uint64_t* launch_epoch() const {
+        return reinterpret_cast<uint64_t*>(base + route_offset() - sizeof(uint64_t));
+    }
     DG_RDMA_HD uint32_t* routes(uint32_t expert) const {
         return reinterpret_cast<uint32_t*>(base + route_offset()) + expert * max_tokens;
     }

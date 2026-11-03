@@ -2,7 +2,10 @@
 
 This branch implements a correctness-first NVSHMEM transport for the SM100
 FP8 activation / MXFP4 weight SwiGLU kernel, including FP8 shared experts.
-It has **not been CUDA-compiled or GPU-tested**. The default remains `nvlink`.
+Both build modes and GPU kernels have been compiled on B300 with CUDA 13.0.
+Single-node eager and CUDA Graph correctness tests include forced remote staging
+with P2P disabled. Multi-node and model/performance validation remain pending.
+The default remains `nvlink`.
 
 ## Protocol
 
@@ -16,7 +19,10 @@ RDMA transport and HCA selection before starting workers.
 1. Local peers retain direct route stores. Remote routes are written into local
    `[global expert][token slot]` staging and sent as one contiguous row per
    populated expert. Each source writes a separate receive-count slot, including
-   zero counts. The existing grid ID plus one is exchanged for every invocation.
+   zero counts. A nonzero, GPU-incremented counter in each RDMA buffer is exchanged
+   for every invocation. CUDA Graph replays can reuse `%gridid`, so it cannot
+   identify a fresh RDMA return. One dispatch thread advances the counter before
+   the existing grid barrier publishes it to the other threads.
 2. Dispatch issuers drain their NVSHMEM operations, synchronize locally, and one
    thread participates in `nvshmem_barrier_all`. Remote input slabs (FP8 tokens,
    packed scales, top-k IDs and weights) are then pulled into local staging.
@@ -29,7 +35,7 @@ RDMA transport and HCA selection before starting workers.
    each top-k slot are sent in contiguous runs. Other ranks' slots are untouched;
    shared-expert output stays local. No 16-byte lane store becomes an RDMA call.
 4. Each peer issuer calls `quiet`, publishes an NVSHMEM ready signal tagged with
-   the **destination** grid ID, and drains it. The destination uses NVSHMEM
+   the **destination** buffer epoch, and drains it. The destination uses NVSHMEM
    `test` before reading the payload, followed by an async-proxy fence for TMA.
    Send-buffer consumption, target ordering, and ring consumer credit remain
    separate events.
@@ -61,8 +67,21 @@ Use the exact DeepGEMM branch paired with the vLLM branch. Requirements:
   Keep that NVSHMEM installation at the same path on the runtime workers.
   JIT compilation uses `nvcc -dc`, an explicit device link, a separate cache
   signature including the device-library contents, and `nvshmemx_cumodule_init`.
+  Both compilation and linking use explicit family-specific `--generate-code`
+  targets; RDC must not introduce generic PTX lacking the kernel's instructions.
+  Unclamped activation is encoded with a separate boolean because NVCC's RDC
+  host stub cannot represent an infinite floating-point template argument.
 - The collective launch carries the required 2-SM cluster attributes, checks
   resident cluster capacity, and disables PDL. Warm up before graph capture.
+
+The runtime must load the same NVSHMEM host library used at build time. Images
+may include an older library through PyTorch or other packages. For the tested
+image, select the new installation before importing PyTorch:
+
+```sh
+export LD_LIBRARY_PATH="$NVSHMEM_HOME/lib:${LD_LIBRARY_PATH:-}"
+export LD_PRELOAD="$NVSHMEM_HOME/lib/libnvshmem_host.so${LD_PRELOAD:+:$LD_PRELOAD}"
+```
 
 ```python
 buffer = deep_gemm.SymmBuffer(
@@ -92,11 +111,45 @@ its offsets against Python, including capacities beyond 4 GiB. It also checks
 allocation disagreement, invalid shapes and asymmetric peer reachability.
 It does not prove device code or network correctness.
 
-When cards become available, run `tests/test_mega_moe.py --transport nvshmem`.
+Run `tests/test_mega_moe.py --transport nvshmem`.
 Its RDMA branch compares eager output and changing-route CUDA Graph replays
 against native EP1 with the same quantized weights; expert-count statistics must
 also agree exactly. It does not initialize a second NVSHMEM transport or silently
 skip numerical verification. The reference supports at most 512 total experts.
+
+On 2026-11-04, single-node B300 validation used CUDA 13.0.88,
+PyTorch 2.13.0+cu130 and NVSHMEM 3.9.0.dev0 built from the revision above:
+
+- Native EP1/EP8 launch smoke tests and both C++ extension build modes passed.
+- NVSHMEM EP1/EP8 eager output and 20 changing-route graph replays matched the
+  native EP1 reference exactly; EP8 included one shared expert.
+- Forced remote EP2 passed eager output, expert counts and 100 changing-route
+  replays after the per-buffer epoch fix. Each rank mapped only itself.
+- Forced remote EP8 also passed 100 replays with one shared expert, rank 0 empty
+  and 50% masked routes. Outputs and expert counts matched exactly.
+- A larger forced remote EP8 case passed 20 replays with 256 experts, top-k 8,
+  hidden 4096, intermediate 2048, 128 tokens per rank, one shared expert and no
+  activation clamp. This also exercises the RDC unclamped-template fix.
+- The vLLM EP1 wrapper passed eager output and 20 changing-route replays with
+  default unclamped activation and separate transport buffer caches.
+
+To exercise remote staging on a single machine, disable P2P and require the
+harness to verify that a peer is unmapped. For example, with this machine's HCA
+and RoCE GID selection (adjust them to the target host):
+
+```sh
+NVSHMEM_DISABLE_P2P=1 NVSHMEM_REMOTE_TRANSPORT=ibrc \
+NVSHMEM_IB_GID_INDEX=3 NVSHMEM_ENABLE_NIC_PE_MAPPING=1 \
+NVSHMEM_HCA_LIST=mlx5_0:1 NVSHMEM_SYMMETRIC_SIZE=2G \
+  .venv/bin/python tests/test_mega_moe.py --transport nvshmem \
+  --require-remote-peers --num-processes 2 --num-experts 32 --num-topk 2 \
+  --hidden 1024 --intermediate-hidden 1024 --num-max-tokens-per-rank 64 \
+  --num-tokens 32 --num-shared-experts 0 --num-correctness-tests 100
+```
+
+This validates the remote protocol through a local HCA; it does not validate
+inter-node routing, fabric behavior or multi-node performance. The native buffer
+rounds token capacity up to its required alignment; staging uses that capacity.
 
 Example per-node test command (existing harness uses `WORLD_SIZE` as the number
 of nodes and `RANK` as the node index; this command spawns eight local workers):
@@ -109,12 +162,12 @@ WORLD_SIZE=2 RANK=0 MASTER_ADDR=<node0-address> MASTER_PORT=8361 \
   --num-shared-experts 1 --num-correctness-tests 100
 ```
 
-Run the corresponding `RANK=1` command on node 1. First validate EP1/8, then
+Run the corresponding `RANK=1` command on node 1. Next validate
 EP16, and EP24 with an expert count divisible by 24 (for example 384; 256 is
 invalid). Include shared expert off/on, `--empty-rank 0`, masked routing,
-capacity/ring wraparound and long replay runs. Still required: compile both
-native/RDMA kernels, deliberate delayed-arrival/failure injection, graph stream
-ordering under the actual NVSHMEM build, sanitizers, and vLLM model evaluation.
+capacity/ring wraparound and long replay runs. Still required: deliberate
+delayed-arrival/failure injection, multi-node graph stream ordering under the
+deployment's NVSHMEM build, sanitizers, and vLLM model evaluation.
 Barrier timeout/error propagation and register pressure require hardware review.
 TPOT/throughput measurement is a separate pending stage.
 

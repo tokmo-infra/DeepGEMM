@@ -26,11 +26,14 @@ def layout_binary(tmp_path_factory):
 #include <iostream>
 int main(int argc, char** argv) {
     using deep_gemm::layout::MegaMoERdmaBuffer;
-    MegaMoERdmaBuffer x(nullptr, std::strtoull(argv[1], nullptr, 10),
+    alignas(128) uint8_t header[1024]{};
+    MegaMoERdmaBuffer x(header, std::strtoull(argv[1], nullptr, 10),
         std::strtoull(argv[2], nullptr, 10), std::strtoull(argv[3], nullptr, 10),
         std::strtoull(argv[4], nullptr, 10), std::strtoull(argv[5], nullptr, 10));
     std::cout << x.input_bytes() << " " << x.output_bytes() << " "
-              << x.input_offset() << " " << x.output_offset() << " " << x.get_num_bytes();
+              << x.input_offset() << " " << x.output_offset() << " " << x.get_num_bytes() << " "
+              << reinterpret_cast<uint8_t*>(x.launch_epoch()) - header << " "
+              << reinterpret_cast<uint8_t*>(x.peer_tokens(x.num_ranks)) - header;
 }
 ''')
     binary = folder / 'layout'
@@ -47,9 +50,14 @@ int main(int argc, char** argv) {
 def test_python_and_compiled_layout_agree_without_32bit_overflow(layout_binary, shape):
     layout = RdmaLayout(*shape)
     result = subprocess.check_output([str(layout_binary), *map(str, shape)], text=True)
-    assert list(map(int, result.split())) == [
+    values = list(map(int, result.split()))
+    assert values == [
         layout.input_bytes, layout.output_bytes, layout.input_offset,
-        layout.output_offset, layout.num_bytes]
+        layout.output_offset, layout.num_bytes, 1016, shape[0] * 8]
+    # The replay counter must be aligned and disjoint from all peer token counts.
+    epoch_offset, peer_tokens_end = values[-2:]
+    assert peer_tokens_end <= epoch_offset and epoch_offset + 8 <= 1024
+    assert epoch_offset % 8 == 0
     assert layout.input_offset >= 1024 + layout.experts * layout.tokens * 4
     assert layout.output_offset >= layout.input_offset + layout.ranks * layout.input_bytes
     assert layout.input_offset % 128 == layout.output_offset % 128 == 0

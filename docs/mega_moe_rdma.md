@@ -3,8 +3,9 @@
 This branch implements a correctness-first NVSHMEM transport for the SM100
 FP8 activation / MXFP4 weight SwiGLU kernel, including FP8 shared experts.
 Both build modes and GPU kernels have been compiled on B300 with CUDA 13.0.
-Single-node eager and CUDA Graph correctness tests include forced remote staging
-with P2P disabled. Multi-node and model/performance validation remain pending.
+Single-node tests include forced remote staging with P2P disabled. Cross-node
+EP8 (four GPUs per node) also passed exact correctness checks, with measured
+layer timings. Larger EP sizes and model serving validation remain pending.
 The default remains `nvlink`.
 
 ## Protocol
@@ -151,6 +152,62 @@ This validates the remote protocol through a local HCA; it does not validate
 inter-node routing, fabric behavior or multi-node performance. The native buffer
 rounds token capacity up to its required alignment; staging uses that capacity.
 
+### Cross-node correctness and layer timing
+
+Two B300 nodes with four GPUs each passed eager and 100 changing-route graph
+replays, including a shared expert, an empty rank and 50% masked routes. Each
+rank directly mapped only its four node-local peers. The same test harness can
+also benchmark both transports against its native EP1 reference:
+
+```sh
+WORLD_SIZE=2 RANK=0 MASTER_ADDR=<node0-address> MASTER_PORT=8361 \
+  .venv/bin/python tests/test_mega_moe.py --num-processes 4 \
+  --transport nvshmem --require-remote-peers \
+  --num-experts 384 --num-topk 6 --hidden 5120 --intermediate-hidden 2304 \
+  --num-shared-experts 1 --num-max-tokens-per-rank 512 --num-tokens 128 \
+  --num-correctness-tests 100 --benchmark-iterations 20 --benchmark-repeats 7
+```
+
+Run `RANK=1` on the second node with matching NIC/bootstrap settings. For the
+single-node EP8 controls, use `WORLD_SIZE=1`, eight local processes, and omit
+`--require-remote-peers`; test both `nvlink` and `nvshmem`.
+
+Each timed graph contains 20 fused calls including input copies and statistics
+resets. Three graphs warm up before seven timed batches. Reference checks,
+quantization, inter-batch barriers and JIT are outside the timing. Outputs and
+counts are checked after each timed batch. The original seeded inputs and routes
+are restored after correctness replays; `BENCHMARK_JSON` includes their SHA-256
+per rank so different transports can verify an identical workload. Report the
+median of each batch's maximum rank-average latency. These are synthetic MoE
+layer measurements, not serving throughput or request latency percentiles.
+
+NVSHMEM IBGDA can be enabled with `NVSHMEM_IB_ENABLE_IBGDA=1`. Inspect the actual
+NIC handler in `NVSHMEM_DEBUG=INFO` logs: with the tested driver/container
+configuration, even a `gpu` handler request fell back to CPU host memory after
+`cudaHostRegister(IoMemory)` returned error 800. Adding `SYS_RAWIO` did not
+change that. Do not report these runs as pure GPU doorbell measurements.
+
+Measured on 2026-11-04 with B300, CUDA 13.0.88, PyTorch 2.13.0+cu130 and the
+NVSHMEM revision above. All cases use EP8, 384 experts, top-k 6, hidden 5120,
+intermediate 2304, one shared expert and SwiGLU clamp 10. Requested capacity 512
+aligns to 1920. Cross-node cases use four GPUs and one shared RoCE HCA per node;
+native and NVSHMEM local controls use eight GPUs on one node. The two nodes use
+drivers 580.105.08 and 580.196.07. Median layer latency in milliseconds:
+
+| Tokens per rank | Native NVLink | Local NVSHMEM | Cross-node IBRC | Cross-node IBGDA, CPU handler |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 0.191 | 0.226 | 84.277 | 11.719 |
+| 512 | 0.225 | 0.258 | 217.581 | 16.398 |
+
+All eight cases passed exact checks and used matching per-rank input hashes.
+Both IBGDA cases also passed 100 changing-route replays. CPU-assisted IBGDA was
+7.2–13.3 times faster than IBRC here, but remained 61.5–73.0 times slower than
+native NVLink. Its batch-average ranges were 9.206–15.102 ms and 15.520–25.122 ms.
+These measurements do not establish a cross-node deployment benefit or measure
+pure GPU NIC progress. Full-capacity prefetch, return fragmentation and barriers
+remain optimization candidates, not profiled attributions. Additional RDMA
+staging was 1,028,875,264 bytes per rank, beyond the 355,896,704-byte native buffer.
+
 Example per-node test command (existing harness uses `WORLD_SIZE` as the number
 of nodes and `RANK` as the node index; this command spawns eight local workers):
 
@@ -162,14 +219,14 @@ WORLD_SIZE=2 RANK=0 MASTER_ADDR=<node0-address> MASTER_PORT=8361 \
   --num-shared-experts 1 --num-correctness-tests 100
 ```
 
-Run the corresponding `RANK=1` command on node 1. Next validate
+Run the corresponding `RANK=1` command on node 1. Beyond cross-node EP8, validate
 EP16, and EP24 with an expert count divisible by 24 (for example 384; 256 is
 invalid). Include shared expert off/on, `--empty-rank 0`, masked routing,
 capacity/ring wraparound and long replay runs. Still required: deliberate
 delayed-arrival/failure injection, multi-node graph stream ordering under the
 deployment's NVSHMEM build, sanitizers, and vLLM model evaluation.
 Barrier timeout/error propagation and register pressure require hardware review.
-TPOT/throughput measurement is a separate pending stage.
+End-to-end TPOT/throughput measurement is a separate pending stage.
 
 ## API references
 

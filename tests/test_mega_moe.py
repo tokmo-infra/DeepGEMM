@@ -1,6 +1,9 @@
 import argparse
+import hashlib
+import json
 import os
 import random
+import statistics
 import sys
 import torch
 import torch.distributed as dist
@@ -271,7 +274,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist.destroy_process_group()
         return
 
-    if args.transport == 'nvshmem':
+    if args.transport == 'nvshmem' or args.benchmark_iterations:
         # Compare against the unmodified EP1 compute/communication path with
         # the same quantized weights, then change routing on every graph replay.
         # This branch never initializes DeepEP (a second NVSHMEM world).
@@ -279,6 +282,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert not args.post_expert_norm
         assert num_experts <= 512, 'EP1 reference requires at most 512 experts'
         create_inputs()
+        if args.benchmark_iterations:
+            benchmark_inputs = tuple(t.clone() for t in x)
+            benchmark_routes = topk_idx.clone()
         def gather_weights(t):
             gathered = [torch.empty_like(t.contiguous()) for _ in range(num_ranks)]
             dist.all_gather(gathered, t.contiguous(), group=group)
@@ -337,7 +343,74 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             expected_stats = initial_cumulative_local_expert_recv_stats_fused + counts[
                 rank_idx * num_experts_per_rank:(rank_idx + 1) * num_experts_per_rank]
             torch.testing.assert_close(replay_stats, expected_stats.to(replay_stats.dtype), rtol=0, atol=0)
-        dist_print('RDMA eager/graph output and expert-count checks passed', once_in_node=True)
+        dist_print(f'{args.transport} eager/graph output and expert-count checks passed', once_in_node=True)
+        if args.benchmark_iterations:
+            # Correctness replays rotate inputs/routes. Restore the original
+            # seeded workload so replay count cannot bias transport comparisons.
+            for current, original in zip(x, benchmark_inputs):
+                current.copy_(original)
+            topk_idx.copy_(benchmark_routes)
+            if num_shared_experts:
+                block_m = deep_gemm.get_block_m_for_mega_moe(
+                    num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, 'fp8xfp4')
+                shared_l1_x_sf.copy_(_to_shared_mega_moe_sf_layout(x[1], block_m, shared_l1_x_sf.shape[0]))
+            all_routes = uneven_all_gather(topk_idx, group=group)
+            counts = torch.bincount(all_routes[all_routes >= 0], minlength=num_experts)
+            expected_stats = initial_cumulative_local_expert_recv_stats_fused + counts[
+                rank_idx * num_experts_per_rank:(rank_idx + 1) * num_experts_per_rank]
+            input_sha256 = hashlib.sha256(b''.join(
+                t.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+                for t in (*x, topk_idx, topk_weights))).hexdigest()
+            # Time whole batches inside a graph: no Python launch gaps between
+            # iterations. Include input copies/stat resets from run_fused, but
+            # exclude quantization, reference checks and inter-batch barriers.
+            benchmark_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(benchmark_graph):
+                for _ in range(args.benchmark_iterations):
+                    benchmark_y, benchmark_stats = run_fused()
+            for _ in range(args.benchmark_warmups):
+                benchmark_graph.replay()
+            torch.cuda.synchronize()
+            samples_us = []
+            for _ in range(args.benchmark_repeats):
+                dist.barrier()
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                benchmark_graph.replay()
+                end.record()
+                end.synchronize()
+                samples_us.append(start.elapsed_time(end) * 1000 / args.benchmark_iterations)
+                torch.testing.assert_close(benchmark_y, expected_output(), rtol=0, atol=0)
+                torch.testing.assert_close(benchmark_stats, expected_stats.to(benchmark_stats.dtype), rtol=0, atol=0)
+            rank_results = [None] * num_ranks
+            dist.all_gather_object(rank_results, {
+                'rank': rank_idx, 'tokens': num_tokens, 'samples_us': samples_us,
+                'main_buffer_bytes': buffer.buffer.nbytes,
+                'rdma_staging_bytes': 0 if buffer.rdma_buffer is None else buffer.rdma_buffer.nbytes,
+                'nvshmem_hca_list': os.getenv('NVSHMEM_HCA_LIST'),
+                'input_sha256': input_sha256,
+            }, group=group)
+            if rank_idx == 0:
+                critical_us = [max(rank['samples_us'][i] for rank in rank_results)
+                               for i in range(args.benchmark_repeats)]
+                median_us = statistics.median(critical_us)
+                print('BENCHMARK_JSON ' + json.dumps({
+                    'transport': args.transport, 'ranks': num_ranks,
+                    'nodes': int(os.getenv('WORLD_SIZE', '1')),
+                    'nvshmem_ibgda': os.getenv('NVSHMEM_IB_ENABLE_IBGDA', '0'),
+                    'experts': num_experts, 'topk': num_topk,
+                    'hidden': hidden, 'intermediate': intermediate_hidden,
+                    'shared_experts': num_shared_experts,
+                    'capacity': buffer.num_max_tokens_per_rank,
+                    'iterations_per_graph': args.benchmark_iterations,
+                    'warmup_graphs': args.benchmark_warmups,
+                    'max_rank_batch_average_us': critical_us,
+                    'median_us': median_us, 'min_us': min(critical_us), 'max_us': max(critical_us),
+                    'layer_tokens_per_second': sum(rank['tokens'] for rank in rank_results) * 1e6 / median_us,
+                    'rank_results': rank_results,
+                }), flush=True)
         dist.barrier()
         dist.destroy_process_group()
         return
@@ -638,9 +711,15 @@ if __name__ == '__main__':
     parser.add_argument('--post-expert-norm', action='store_true')
     parser.add_argument('--empty-rank', type=int, default=-1)
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
+    parser.add_argument('--benchmark-iterations', type=int, default=0,
+                        help='Opt in to exact-checked timing of this many fused calls per CUDA Graph')
+    parser.add_argument('--benchmark-repeats', type=int, default=7)
+    parser.add_argument('--benchmark-warmups', type=int, default=3)
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--local-rank-idx', type=int, default=None, help='Run as single process with this local rank (e.g. for NCU prof)')
     args = parser.parse_args()
+    assert args.benchmark_iterations >= 0
+    assert args.benchmark_repeats > 0 and args.benchmark_warmups >= 0
 
     # Create dump trace directories
     if args.dump_profile_traces:

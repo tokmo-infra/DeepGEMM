@@ -1364,6 +1364,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             dst_token.get_base_ptr(),
                             n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
                         *transport.output(dst_ptr, dst_rank_idx) = packed;
+                        transport.return_tile(dst_rank_idx, dst_token_idx, dst_topk_idx,
+                                              lane_idx, kHidden / BLOCK_N);
                     }
                 }
 
@@ -1436,13 +1438,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
             );
 
+#ifdef DG_MEGAMOE_NVSHMEM
+        // Preserve cleanup/combine overlap while the NIC completes receives.
+        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+#endif
+
         transport.template finish_returns<kNumSMs, kEpilogueGridSyncIndex>(
             workspace, sm_idx, epilogue_thread_idx,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
 
-        // Barrier with dispatch warps, so that they can do clean workspace
+#ifndef DG_MEGAMOE_NVSHMEM
+        // Keep the native NVLink signal/cleanup ordering unchanged.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+#endif
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         const auto grid_idx = transport.epoch();

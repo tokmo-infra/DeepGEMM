@@ -105,10 +105,17 @@ struct MegaMoETransport {
         // live token prefixes. The barrier publishes peer_tokens with the data.
         if constexpr (kTag == 1) {
             sync();
+            // The dispatch barrier has consumed the route send slab. Reuse it
+            // for row completion counters until the next launch's dispatch.
+            if (sm == 0 and streaming_returns()) {
+                const auto count = kNumRanks * staging.topk * staging.max_tokens;
+                for (uint64_t i = thread; i < count; i += kThreads)
+                    staging.routes(0)[i] = 0;
+            }
             if (sm == 0 and thread < kNumRanks and remote(thread)) {
                 const auto tokens = *staging.peer_tokens(thread);
                 DG_DEVICE_ASSERT(tokens <= staging.max_tokens);
-                if (tokens != 0) {
+                if (input_proxy(thread) == sym.rank_idx and tokens != 0) {
                     const auto pull = [&](const layout::Buffer& part) {
                         auto* src = part.template get_base_ptr<uint8_t>();
                         nvshmem_getmem_nbi(input(src, thread), src,
@@ -118,8 +125,19 @@ struct MegaMoETransport {
                     pull(buffer.input_sf_buffer);
                     pull(buffer.input_topk_idx_buffer);
                     pull(buffer.input_topk_weights_buffer);
+                    nvshmem_quiet();
                 }
-                nvshmem_quiet();
+            }
+            // One cache per directly accessible team; different source PEs
+            // select different cache owners to keep all local NICs active.
+            if (sm == 0) {
+                sync();
+                if (thread == 0 and nvshmem_team_n_pes(NVSHMEM_TEAM_SHARED) > 1 and
+                    nvshmem_team_n_pes(NVSHMEM_TEAM_SHARED) < kNumRanks)
+                    nvshmem_barrier(NVSHMEM_TEAM_SHARED);
+                sync();
+            }
+            if (sm == 0 and thread < kNumRanks and remote(thread)) {
                 // Independent source slots avoid mixed NIC/GPU AMOs. Preserve
                 // the scheduler's kNumSMs * kNumRanks contribution count.
                 for (uint32_t e = 0; e < ws.num_experts_per_rank; ++e)
@@ -135,12 +153,27 @@ struct MegaMoETransport {
 #endif
     }
 
+    CUTLASS_DEVICE uint32_t input_proxy(uint32_t peer) const {
+#ifdef DG_MEGAMOE_NVSHMEM
+        const auto peers = nvshmem_team_n_pes(NVSHMEM_TEAM_SHARED);
+        return nvshmem_team_translate_pe(NVSHMEM_TEAM_SHARED, peer % peers, NVSHMEM_TEAM_WORLD);
+#else
+        return sym.rank_idx;
+#endif
+    }
+
     template <typename Ptr>
     CUTLASS_DEVICE Ptr input(Ptr ptr, uint32_t peer) const {
         if (not remote(peer))
             return sym.map(ptr, peer);
         const auto offset = reinterpret_cast<const uint8_t*>(ptr) - buffer.input_token_buffer.template get_base_ptr<uint8_t>();
-        return reinterpret_cast<Ptr>(static_cast<uint8_t*>(staging.inputs(peer)) + offset);
+#ifdef DG_MEGAMOE_NVSHMEM
+        auto* base = static_cast<uint8_t*>(nvshmem_ptr(staging.inputs(peer), input_proxy(peer)));
+        DG_DEVICE_ASSERT(base != nullptr);
+        return reinterpret_cast<Ptr>(base + offset);
+#else
+        return nullptr;
+#endif
     }
 
     template <typename Ptr>
@@ -151,12 +184,41 @@ struct MegaMoETransport {
         return reinterpret_cast<Ptr>(static_cast<uint8_t*>(staging.outputs(peer)) + offset);
     }
 
+    CUTLASS_DEVICE bool streaming_returns() const {
+#ifdef DG_MEGAMOE_NVSHMEM
+        return staging.can_stream_returns();
+#else
+        return false;
+#endif
+    }
+
+    CUTLASS_DEVICE void return_tile(uint32_t peer, uint32_t token, uint32_t slot,
+                                    uint32_t lane, uint32_t num_tiles) const {
+#ifdef DG_MEGAMOE_NVSHMEM
+        if (not streaming_returns() or not remote(peer)) return;
+        // Each half warp stores one row fragment. Release/acquire RMWs join
+        // fragments produced by different CTAs; the last one sends the row
+        // while the original MegaMoE pipeline continues computing other tiles.
+        __syncwarp(lane < 16 ? 0x0000ffff : 0xffff0000);
+        if (lane % 16 == 0) {
+            auto* counter = staging.return_counter(peer, slot, token);
+            uint32_t old;
+            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"
+                         : "=r"(old) : "l"(counter) : "memory");
+            if (old == num_tiles - 1) {
+                auto* dst = buffer.combine_token_buffer.get_rank_buffer(slot).get_data_buffer(token).get_base_ptr();
+                nvshmem_putmem_nbi(dst, output(dst, peer), staging.hidden * 2, peer);
+            }
+        }
+#endif
+    }
+
     template <uint32_t kThreads, typename Sync>
     CUTLASS_DEVICE void return_and_signal(uint32_t thread, uint64_t epoch, const Sync& sync) const {
 #ifdef DG_MEGAMOE_NVSHMEM
         // Spread independent return rows across the epilogue CTA instead of
         // serializing every row for a destination in one GPU lane.
-        for (uint32_t peer = 0; peer < kNumRanks; ++peer) {
+        for (uint32_t peer = 0; not streaming_returns() and peer < kNumRanks; ++peer) {
             if (not remote(peer)) continue;
             const auto* indices = input(buffer.input_topk_idx_buffer.template get_base_ptr<int64_t>(), peer);
             const auto tokens = *staging.peer_tokens(peer);
@@ -170,15 +232,20 @@ struct MegaMoETransport {
                 }
             }
         }
-        // Each complete warp drains its issuers collectively, then the CTA
-        // rendezvous permits different threads to publish destination epochs.
-        nvshmemx_quiet_warp();
+        // The existing epilogue grid sync orders all streaming submissions
+        // before this CTA. One elected warp can complete the PE's operations;
+        // a quiet in every issuing warp would repeatedly drain the same QPs.
+        sync();
+        if (thread < 32)
+            nvshmemx_quiet_warp();
         sync();
         if (thread < kNumRanks) {
             auto* ready = buffer.workspace.get_combine_ready_grid_idx_ptr(sym.rank_idx);
             nvshmemx_signal_op(ready, epoch, NVSHMEM_SIGNAL_SET, thread);
-            nvshmem_quiet();
         }
+        sync();
+        if (thread < 32)
+            nvshmemx_quiet_warp();
 #else
         if (thread < kNumRanks) {
             auto* ready = buffer.workspace.get_combine_ready_grid_idx_ptr(sym.rank_idx);

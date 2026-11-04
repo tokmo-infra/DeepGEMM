@@ -25,32 +25,41 @@ RDMA transport and HCA selection before starting workers.
    identify a fresh RDMA return. One dispatch thread advances the counter before
    the existing grid barrier publishes it to the other threads.
 2. CTA 0's dispatch warps drain their NVSHMEM operations collectively, synchronize
-   locally, and one thread participates in `nvshmem_barrier_all`. Remote inputs
-   (FP8 tokens, packed scales, top-k IDs and weights) are then pulled into local
-   staging. Only the live token prefixes are transferred; capacity-based offsets
-   remain unchanged. An empty peer issues no input transfer.
-   Counts from remote sources are accumulated **locally**, preserving the
-   scheduler's `num_sms * num_ranks` high-word readiness condition. NIC atomics
-   never contend with GPU atomics on the expert sum. A final local grid sync
-   publishes the staged inputs before the existing ring-buffer pipeline runs.
-3. Remote GEMM2 stores write local staging in `[peer][top-k][token][hidden]`
-   order. After the epilogue grid sync, the whole epilogue CTA distributes
-   independent owned rows across its threads. Each RDMA operation transfers a
-   complete hidden row, avoiding a serial row loop in one lane per destination.
-   Other ranks' slots are untouched; shared-expert output stays local.
-4. Each issuing warp calls collective `quiet`, then a CTA rendezvous permits
-   peer threads to publish an NVSHMEM ready signal tagged with the **destination**
-   buffer epoch and drain it. One destination thread uses NVSHMEM `test_all` on
-   all peers' readiness signals, and an epilogue grid sync distributes completion
-   to combine readers. TMA reads retain the async-proxy fence. Per-token polling
-   therefore need not repeat the NVSHMEM target-consistency operation.
-   Send-buffer consumption, target ordering, and ring consumer credit remain
-   separate events.
-5. The cleanup barrier follows all outgoing returns. Stream serialization and
-   the next dispatch barrier prevent a later epoch from overtaking a previous
-   combine. No collective free is run from a destructor. Allocations and loaded
-   modules intentionally live for the worker process lifetime; reusing the same
-   `SymmBuffer` is required to bound memory use.
+   locally, and one thread participates in `nvshmem_barrier_all`. Only live input
+   prefixes are fetched; capacity offsets remain unchanged. Within each
+   `NVSHMEM_TEAM_SHARED` clique, one cache owner fetches each remote source's
+   FP8 tokens, scales, top-k IDs and weights. Source PE modulo shared-team size
+   selects the owner, spreading traffic across local NICs. A shared-team barrier
+   publishes completed caches for direct NVLink reads by other local GPUs.
+   NVSHMEM reduces this team to self when it cannot establish a shared clique;
+   that configuration retains one independent cache per GPU.
+   Remote counts are accumulated **locally**, preserving the scheduler's
+   `num_sms * num_ranks` readiness condition without mixing NIC and GPU atomics.
+   The existing final grid sync publishes inputs before the ring pipeline runs.
+3. Remote GEMM2 stores retain `[peer][top-k][token][hidden]` staging. Each half
+   warp synchronizes after storing a row fragment, then its elected lane uses
+   an acquire/release atomic tile counter. The last tile submits the complete
+   hidden row immediately, while the original pipeline continues other tiles.
+   After dispatch completes, its dead route send slab holds these counters;
+   there is no new allocation or layout ABI change. If `ranks * topk > experts`,
+   the counters would not fit, so the epilogue CTA instead sends owned rows after
+   its grid sync. Other expert ranks' slots are untouched; shared output stays
+   local. GEMM scheduling, TMA stages, ring credits and reduction order are kept.
+4. The existing epilogue grid sync orders all streaming submissions. One elected
+   warp completes the PE's outstanding RMA, a CTA rendezvous precedes publishing
+   the **destination** epochs, and another collective quiet completes signals.
+   NVSHMEM permits one thread/warp to perform quiet after synchronization with
+   all issuers; repeating it in every issuing warp is unnecessary.
+   Dispatch cleanup starts after outgoing completion, overlapping receipt checks
+   and combine. One destination thread uses NVSHMEM `test_all` on all readiness
+   signals, then an epilogue grid sync distributes completion to combine readers.
+   TMA reads retain their async-proxy fence. Send-buffer consumption, target
+   visibility and ring consumer credit remain separate events.
+5. Stream serialization and the next dispatch barrier prevent a later epoch
+   from overtaking a previous combine or overwriting a shared input cache still
+   in use. No collective free is run from a destructor. Allocations and loaded
+   modules live for the worker process lifetime; reuse the same `SymmBuffer`
+   to bound memory use.
 
 The native path keeps its original barriers and direct operations. RDMA reserves
 full-capacity input and output staging, while transferring only valid inputs
@@ -116,8 +125,9 @@ CPU-only checks, run locally with no CUDA runtime:
 ```
 
 This compiles the real staging-layout header with a host C++ compiler and checks
-its offsets against Python, including capacities beyond 4 GiB. It also checks
-allocation disagreement, invalid shapes and asymmetric peer reachability.
+its offsets against Python, including capacities beyond 4 GiB and counter-slab
+exact-fit/fallback boundaries. It also checks allocation disagreement, invalid
+shapes and asymmetric peer reachability.
 It does not prove device code or network correctness.
 
 Run `tests/test_mega_moe.py --transport nvshmem`.
@@ -234,9 +244,9 @@ All eight baseline cases passed exact checks and used matching per-rank input
 hashes. Both IBGDA cases also passed 100 changing-route replays. Their
 batch-average ranges were 9.206–15.102 ms and 15.520–25.122 ms.
 
-After live-prefix prefetch, parallel return submission, scoped collective
-completion, one target-consistency check per layer, and the runtime corrections
-above, the cross-node results were:
+The previous revision added live-prefix prefetch, parallel return submission,
+scoped collective completion and one target-consistency check per layer. With
+the runtime corrections above, its cross-node results were:
 
 | Tokens per rank | GPU-handler IBGDA median ms | Min–max ms | Speedup over initial IBGDA |
 | ---: | ---: | ---: | ---: |
@@ -253,15 +263,50 @@ An additional A/B run of the original kernel with the final GPU handler, HCA
 mapping and traffic class measured 6.480 ms (6.479–6.496 ms) at 128 tokens/rank,
 versus 1.072 ms with the final kernel: a 6.0x kernel speedup under the same
 runtime configuration and input hashes.
-The smaller batch now transfers 10,960,896 input bytes per node instead of
+That revision transfers 10,960,896 input bytes per node at 128 tokens instead of
 164,413,440 (layout-derived, excluding routes and returns). Additional RDMA
 staging remains 1,028,875,264 bytes per rank, beyond the 355,896,704-byte native
 buffer. These results still do not establish a full-model deployment benefit.
 
-Final single-node EP8 controls also passed 20 changing-route replays per case
-and the same seven timed-batch checks. Native NVLink measured 0.192/0.225 ms
-and local NVSHMEM measured 0.217/0.249 ms at 128/512 tokens per rank. The final
-cross-node path remains about 5.6/12.4 times slower than native NVLink here.
+The previous single-node EP8 controls passed 20 changing-route replays per
+case and the same seven timed-batch checks. Native NVLink measured 0.192/0.225 ms
+and local NVSHMEM measured 0.217/0.249 ms at 128/512 tokens per rank. Those
+cross-node results were about 5.6/12.4 times slower than native NVLink.
+
+The current revision adds shared-team input caching and sends each remote
+result row as soon as GEMM2 finishes its last tile. One elected warp drains
+posted returns after the existing grid sync, while workspace cleanup overlaps
+incoming completion and combine. Native NVLink retains its original ordering;
+GEMM/TMA scheduling, ring credits and top-k reduction order are unchanged.
+No extra staging is allocated. At four GPUs per node, input payload falls by
+4x to 2,740,224 / 10,960,896 bytes per node at 128 / 512 tokens (layout-derived,
+excluding routes and returns).
+
+With the same runtime configuration and seeded workloads, the current cross-node
+medians are **0.846 / 1.986 ms** (ranges 0.837–0.849 / 1.980–2.061 ms), reducing
+latency by **21% / 29%** versus 1.072 / 2.800 ms. Each case passed 100 changing-route
+replays and exact checks after all seven timed batches. Packet gathering into
+larger messages regressed performance and was discarded. RC=8 did not clearly
+improve the streaming implementation, RC=16 regressed, and splitting prefetch
+into 64 KiB requests provided no measurable benefit; defaults remain RC=2 and
+request batch 32. The cross-node protocol still has dispatch/prefetch barriers
+and receive waits; preserving the native compute pipeline does not remove
+these network stalls.
+
+The current kernel passed nine cross-node cases with 100 changing-route replays
+each: both performance shapes, shared disabled, empty rank plus 50% masked
+routes, uneven token counts, IBRC fallback, insufficient counter space
+(32 experts / top-k 5), P2P disabled (each shared team is self), and exact-fit
+counter storage (32 experts / top-k 4) with 1920 tokens per rank. CPU layout and
+contract checks pass all 18 tests, including the counter boundary conditions.
+
+With the same final headers, single-node EP8 controls passed 20 changing-route
+replays each and all timed-batch checks. Native NVLink measured 0.191 / 0.225 ms
+at 128 / 512 tokens (previously 0.192 / 0.225 ms); local NVSHMEM measured
+0.220 / 0.253 ms (previously 0.217 / 0.249 ms). The native path shows no
+measurable regression in these cases. Cross-node execution remains about
+4.4 / 8.8 times slower than native NVLink, so further network and protocol
+optimization is still required before a deployment performance claim.
 
 Example per-node test command (existing harness uses `WORLD_SIZE` as the number
 of nodes and `RANK` as the node index; this command spawns eight local workers):

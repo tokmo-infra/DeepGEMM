@@ -46,6 +46,12 @@ struct MegaMoERdmaBuffer {
     DG_RDMA_HD uint32_t* routes(uint32_t expert) const {
         return reinterpret_cast<uint32_t*>(base + route_offset()) + expert * max_tokens;
     }
+    // The dispatch route slab is dead after its collective completion. Reuse
+    // it for return-row tile counts only when every possible row fits.
+    DG_RDMA_HD bool can_stream_returns() const { return num_ranks * topk <= num_experts; }
+    DG_RDMA_HD uint32_t* return_counter(uint32_t peer, uint32_t slot, uint32_t token) const {
+        return routes(0) + (peer * topk + slot) * max_tokens + token;
+    }
     DG_RDMA_HD void* inputs(uint32_t peer) const {
         return base + input_offset() + peer * input_bytes();
     }

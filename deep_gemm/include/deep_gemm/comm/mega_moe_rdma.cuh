@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deep_gemm/comm/barrier.cuh>
+#include <deep_gemm/comm/mega_moe_return_queue.cuh>
 #include <deep_gemm/layout/mega_moe_rdma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
@@ -11,8 +12,27 @@
 
 namespace deep_gemm::comm {
 
+#ifdef DG_MEGAMOE_NVSHMEM
+struct MegaMoEReturnQueueAtomic {
+    CUTLASS_DEVICE static uint32_t load(const uint32_t* ptr) {
+        uint32_t value;
+        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(value) : "l"(ptr) : "memory");
+        return value;
+    }
+    CUTLASS_DEVICE static void store(uint32_t* ptr, uint32_t value) {
+        asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
+    }
+    CUTLASS_DEVICE static uint32_t add(uint32_t* ptr, uint32_t value) {
+        uint32_t old;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                     : "=r"(old) : "l"(ptr), "r"(value) : "memory");
+        return old;
+    }
+};
+#endif
+
 // Only instantiated in the opt-in SM100 FP8 x MXFP4 SwiGLU kernel.
-template <uint32_t kNumRanks>
+template <uint32_t kNumRanks, uint32_t kReturnSenders = 0>
 struct MegaMoETransport {
     const layout::SymBuffer<kNumRanks>& sym;
     const layout::MegaMoEBuffer& buffer;
@@ -108,7 +128,7 @@ struct MegaMoETransport {
             // The dispatch barrier has consumed the route send slab. Reuse it
             // for row completion counters until the next launch's dispatch.
             if (sm == 0 and streaming_returns()) {
-                const auto count = kNumRanks * staging.topk * staging.max_tokens;
+                const auto count = queued_returns() ? staging.return_queue_words(kReturnSenders) : staging.return_rows();
                 for (uint64_t i = thread; i < count; i += kThreads)
                     staging.routes(0)[i] = 0;
             }
@@ -192,15 +212,30 @@ struct MegaMoETransport {
 #endif
     }
 
+    CUTLASS_DEVICE bool queued_returns() const {
+#ifdef DG_MEGAMOE_NVSHMEM
+        if constexpr (kReturnSenders > 0)
+            return staging.can_queue_returns(kReturnSenders);
+#endif
+        return false;
+    }
+
     CUTLASS_DEVICE void return_tile(uint32_t peer, uint32_t token, uint32_t slot,
                                     uint32_t lane, uint32_t num_tiles) const {
 #ifdef DG_MEGAMOE_NVSHMEM
         if (not streaming_returns() or not remote(peer)) return;
         // Each half warp stores one row fragment. Release/acquire RMWs join
-        // fragments produced by different CTAs; the last one sends the row
-        // while the original MegaMoE pipeline continues computing other tiles.
+        // fragments produced by different CTAs. In queued mode, the last one
+        // publishes a descriptor; only retired dispatch warps call NVSHMEM.
         __syncwarp(lane < 16 ? 0x0000ffff : 0xffff0000);
         if (lane % 16 == 0) {
+            if constexpr (kReturnSenders > 0) {
+                if (queued_returns()) {
+                    const auto row = (peer * staging.topk + slot) * staging.max_tokens + token;
+                    MegaMoEReturnQueue<kReturnSenders, MegaMoEReturnQueueAtomic>{staging}.publish_tile(row, num_tiles);
+                    return;
+                }
+            }
             auto* counter = staging.return_counter(peer, slot, token);
             uint32_t old;
             asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"
@@ -209,6 +244,36 @@ struct MegaMoETransport {
                 auto* dst = buffer.combine_token_buffer.get_rank_buffer(slot).get_data_buffer(token).get_base_ptr();
                 nvshmem_putmem_nbi(dst, output(dst, peer), staging.hidden * 2, peer);
             }
+        }
+#endif
+    }
+
+    CUTLASS_DEVICE void progress_returns(uint32_t sm, uint32_t warp, uint32_t lane) const {
+#ifdef DG_MEGAMOE_NVSHMEM
+        if constexpr (kReturnSenders > 0) {
+            if (not queued_returns() or sm >= kReturnSenders or warp != 0) return;
+            const auto queue = MegaMoEReturnQueue<kReturnSenders, MegaMoEReturnQueueAtomic>{staging};
+            uint32_t cursor = lane;
+            // All lanes participate, including those with no rows. Later lanes
+            // can submit while an earlier producer's reserved slot is unready.
+            wait_until([&]() {
+                uint32_t row;
+                const bool submitted = queue.peek(sm, cursor, row);
+                if (submitted) {
+                    const auto token = row % staging.max_tokens;
+                    const auto slot = row / staging.max_tokens % staging.topk;
+                    const auto peer = row / (staging.max_tokens * staging.topk);
+                    auto* dst = buffer.combine_token_buffer.get_rank_buffer(slot).get_data_buffer(token).get_base_ptr();
+                    nvshmem_putmem_nbi(dst, output(dst, peer), staging.hidden * 2, peer);
+                    cursor += 32;
+                }
+                const bool done = __all_sync(0xffffffff, queue.closed_and_empty(sm, cursor));
+                if (not __any_sync(0xffffffff, submitted) and not done) __nanosleep(64);
+                return done;
+            }, [&]() { printf("DeepGEMM RDMA sender timeout: rank=%u shard=%u lane=%u cursor=%u\n",
+                              sym.rank_idx, sm, lane, cursor); });
+            __syncwarp();
+            if (lane == 0) queue.finish_sender();
         }
 #endif
     }
@@ -232,8 +297,18 @@ struct MegaMoETransport {
                 }
             }
         }
-        // The existing epilogue grid sync orders all streaming submissions
-        // before this CTA. One elected warp can complete the PE's operations;
+        if constexpr (kReturnSenders > 0) {
+            if (queued_returns() and thread == 0) {
+                const auto queue = MegaMoEReturnQueue<kReturnSenders, MegaMoEReturnQueueAtomic>{staging};
+                queue.close();
+                wait_until([&]() { return queue.all_senders_done(); }, [&]() {
+                    printf("DeepGEMM RDMA sender join timeout: rank=%u\n", sym.rank_idx);
+                });
+            }
+        }
+        // The epilogue grid sync joins producers. Queued mode additionally
+        // joins all senders before quiet can observe their submissions.
+        // One elected warp can complete the PE's operations;
         // a quiet in every issuing warp would repeatedly drain the same QPs.
         sync();
         if (thread < 32)

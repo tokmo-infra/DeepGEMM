@@ -3,6 +3,17 @@
 from dataclasses import dataclass
 
 
+def validate_return_senders(value):
+    """Validate the experimental queue knob before collective allocation."""
+    # Match C++ from_chars, including rejecting whitespace, '+' and non-ASCII digits.
+    if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
+        raise ValueError('DG_MEGAMOE_RDMA_RETURN_SENDERS must be an integer in 0..32')
+    senders = int(value)
+    if not 0 <= senders <= 32:
+        raise ValueError('DG_MEGAMOE_RDMA_RETURN_SENDERS must be an integer in 0..32')
+    return senders
+
+
 @dataclass(frozen=True)
 class RdmaLayout:
     ranks: int

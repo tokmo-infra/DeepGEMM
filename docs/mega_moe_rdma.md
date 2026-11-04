@@ -7,6 +7,8 @@ Single-node tests include forced remote staging with P2P disabled. Cross-node
 EP8 (four GPUs per node) also passed exact correctness checks, with measured
 layer timings. Larger EP sizes and model serving validation remain pending.
 The default remains `nvlink`.
+GPU results below describe the validated streaming baseline (`67f08c5`). The
+optional queued-return implementation described below awaits GPU validation.
 
 ## Protocol
 
@@ -117,6 +119,68 @@ launches on a shared buffer, base-buffer aliasing, other precision/activation
 paths, and `DG_COMM_KERNEL_DEBUG` are unsupported in this first version.
 
 ## Validation
+
+### Queued returns: opt-in prototype, GPU validation pending
+
+`DG_MEGAMOE_RDMA_RETURN_SENDERS=16` selects a sharded return queue for RDMA.
+The default `0` keeps the validated direct streaming path; values `1..32`
+select that many sender warps, capped by the kernel's CTA count. Set the same
+value on all workers **before allocating buffers and warming up**, and restart
+workers when changing it. Rebuild the matching DeepGEMM extension: an older
+extension does not forward this option to JIT. The option is included in the
+allocation agreement and JIT cache key. Native NVLink ignores it.
+
+Each selected CTA's first dispatch warp becomes a sender only after finishing
+all its original input pulls. No extra CTA, warp, shared-memory allocation or
+SM reservation is introduced. GEMM/TMA scheduling, ring credits, register
+budgets, shared-expert computation and top-k reduction order are unchanged.
+The last tile of a remote row publishes a descriptor with release ordering;
+the epilogue never waits for a sender or calls NVSHMEM to submit that row.
+Senders acquire descriptors and submit complete BF16 rows while remaining
+GEMM work proceeds. All SMs remain available to the original compute pipeline.
+
+Queues are append-only within a launch. For `R = ranks * topk * capacity` rows
+and `S` senders, row `r` belongs to shard `r % S`, with `ceil(R / S)` entries.
+Counters, entries, tails, close and sender-completion state occupy
+`R + S * ceil(R / S) + S + 2` words of the completed dispatch route slab.
+Every possible row fits without recycling entries or waiting for queue space,
+even if senders start after all producers finish. With EP8/E384/K6/capacity1920
+and 16 senders this uses 737,352 bytes of the existing 2,949,120-byte route slab.
+Main/staging allocation sizes and RDMA ABI 1 remain unchanged. If the queue does
+not fit, execution retains direct streaming; if counters also do not fit, it
+retains the existing post-grid scan fallback.
+
+A reserved ticket is not a ready descriptor: readers wait for a nonzero entry
+and can advance other lanes past a delayed publication. The existing epilogue
+grid rendezvous joins all producers before CTA 0 closes the queues. Senders
+drain them and publish completion only after every lane returns from its put
+calls. CTA 0 acquires all sender completions before the existing elected quiet
+warp, peer epoch signals and receive checks. This preserves the required
+ordering between different issuing threads and `nvshmem_quiet`. Workspace
+cleanup and combine retain their existing overlap; no per-row quiet is added.
+The next dispatch completion resets the queue before any new row publication.
+
+CPU checks exercise the real queue protocol with C++ atomics, including delayed
+publication, full-capacity producers preceding consumers, concurrent fragment
+visibility, empty/masked routes and repeated resets. These do not prove CUDA
+memory ordering, NIC progress, graph replay correctness or performance.
+On 2026-11-04, all 38 CPU contract tests and the queue tests under
+ThreadSanitizer passed. CUDA 13.0.88 compiled/linked 16 offline cases without
+GPU access: both primary block shapes, sender counts 8/16/32, both storage
+fallbacks, shared expert off and a sender-count clamp. The native NVLink kernel
+instruction bytes matched the preceding revision for both primary shapes.
+Queued fusion bodies reported 116 registers and no spill loads/stores; NVSHMEM
+library functions still have their own stack/spill usage. These compiler
+figures do not measure runtime register pressure or latency.
+Until hardware tests pass, keep the default `0`. Required A/B runs compare
+`0/8/16/32` with identical seeded inputs, 100 changing-route graph replays and
+the seven-batch timing checks below. Include queue-storage fallback, no shared
+expert, uneven/empty ranks, all-masked routes, P2P disabled, local NVSHMEM and
+native NVLink controls. Record sender start times, epilogue completion, sender
+join, quiet, register spills and end-to-end layer latency; a shorter epilogue
+alone is insufficient to establish an improvement.
+
+### CPU contract checks
 
 CPU-only checks, run locally with no CUDA runtime:
 
@@ -273,7 +337,7 @@ case and the same seven timed-batch checks. Native NVLink measured 0.192/0.225 m
 and local NVSHMEM measured 0.217/0.249 ms at 128/512 tokens per rank. Those
 cross-node results were about 5.6/12.4 times slower than native NVLink.
 
-The current revision adds shared-team input caching and sends each remote
+The validated streaming baseline adds shared-team input caching and sends each remote
 result row as soon as GEMM2 finishes its last tile. One elected warp drains
 posted returns after the existing grid sync, while workspace cleanup overlaps
 incoming completion and combine. Native NVLink retains its original ordering;
@@ -282,7 +346,7 @@ No extra staging is allocated. At four GPUs per node, input payload falls by
 4x to 2,740,224 / 10,960,896 bytes per node at 128 / 512 tokens (layout-derived,
 excluding routes and returns).
 
-With the same runtime configuration and seeded workloads, the current cross-node
+With the same runtime configuration and seeded workloads, that baseline's cross-node
 medians are **0.846 / 1.986 ms** (ranges 0.837–0.849 / 1.980–2.061 ms), reducing
 latency by **21% / 29%** versus 1.072 / 2.800 ms. Each case passed 100 changing-route
 replays and exact checks after all seven timed batches. Packet gathering into
@@ -293,7 +357,7 @@ request batch 32. The cross-node protocol still has dispatch/prefetch barriers
 and receive waits; preserving the native compute pipeline does not remove
 these network stalls.
 
-The current kernel passed nine cross-node cases with 100 changing-route replays
+The streaming baseline passed nine cross-node cases with 100 changing-route replays
 each: both performance shapes, shared disabled, empty rank plus 50% masked
 routes, uneven token counts, IBRC fallback, insufficient counter space
 (32 experts / top-k 5), P2P disabled (each shared team is self), and exact-fit

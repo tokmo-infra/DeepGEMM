@@ -400,6 +400,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     'transport': args.transport, 'ranks': num_ranks,
                     'nodes': int(os.getenv('WORLD_SIZE', '1')),
                     'nvshmem_ibgda': os.getenv('NVSHMEM_IB_ENABLE_IBGDA', '0'),
+                    'rdma_return_senders_requested': (int(os.getenv('DG_MEGAMOE_RDMA_RETURN_SENDERS', '0'))
+                                                      if args.transport == 'nvshmem' else 0),
                     'experts': num_experts, 'topk': num_topk,
                     'hidden': hidden, 'intermediate': intermediate_hidden,
                     'shared_experts': num_shared_experts,

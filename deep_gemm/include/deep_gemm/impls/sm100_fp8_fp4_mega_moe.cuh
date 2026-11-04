@@ -138,7 +138,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumSharedExperts
     );
     const auto workspace = buffer.workspace;
-    const auto transport = comm::MegaMoETransport<kNumRanks>{
+#if defined(DG_MEGAMOE_NVSHMEM) && defined(DG_MEGAMOE_RDMA_RETURN_SENDERS)
+    DG_STATIC_ASSERT(DG_MEGAMOE_RDMA_RETURN_SENDERS >= 0 and DG_MEGAMOE_RDMA_RETURN_SENDERS <= 32, "Invalid RDMA sender count");
+    constexpr uint32_t kReturnSenders = DG_MEGAMOE_RDMA_RETURN_SENDERS < kNumSMs ? DG_MEGAMOE_RDMA_RETURN_SENDERS : kNumSMs;
+#else
+    constexpr uint32_t kReturnSenders = 0;
+#endif
+    const auto transport = comm::MegaMoETransport<kNumRanks, kReturnSenders>{
         sym_buffer, buffer, layout::MegaMoERdmaBuffer(rdma_buffer, kNumRanks, kNumExperts,
                                                     kNumMaxTokensPerRank, kHidden, kNumTopk)};
 
@@ -620,6 +626,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
+
+        // Reuse only dispatch warps that have finished every input pull. No
+        // extra CTAs, warp roles, ring credits or GEMM scheduling are needed.
+        transport.progress_returns(sm_idx, warp_idx, lane_idx);
 
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue

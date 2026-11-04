@@ -36,6 +36,12 @@ int main(int argc, char** argv) {
               << reinterpret_cast<uint8_t*>(x.peer_tokens(x.num_ranks)) - header << " "
               << x.can_stream_returns() << " "
               << reinterpret_cast<uint8_t*>(x.return_counter(x.num_ranks - 1, x.topk - 1, x.max_tokens - 1) + 1) - header;
+    if (argc > 6) {
+        const auto senders = std::strtoul(argv[6], nullptr, 10);
+        std::cout << " " << x.can_queue_returns(senders);
+        if (senders) std::cout << " " << x.return_queue_capacity(senders) << " " << x.return_queue_words(senders)
+                             << " " << reinterpret_cast<uint8_t*>(x.return_queue_done(senders) + 1) - header;
+    }
 }
 ''')
     binary = folder / 'layout'
@@ -75,6 +81,50 @@ def test_return_counters_cannot_overlap_live_input_staging(layout_binary, expert
     assert (counter_end <= values[2]) is streaming
     if streaming:
         assert counter_end <= 1024 + experts * 1920 * 4
+
+
+@pytest.mark.parametrize('shape,senders,queued', [
+    ((8, 384, 1920, 5120, 6), 16, True),
+    ((8, 32, 1920, 5120, 4), 16, False),  # Counters fit; queue does not.
+    ((8, 32, 1920, 5120, 5), 16, False),  # Neither fits; retains scan fallback.
+    ((8, 96, 1920, 5120, 6), 16, False),  # Must budget tails/close/join too.
+    ((8, 104, 1920, 5120, 6), 16, True),
+    ((3, 33, 4, 128, 3), 3, True),
+    ((72, 2048 - 32, 65536, 16384, 8), 32, True),
+    ((8, 384, 1920, 5120, 6), 0, False),
+])
+def test_queue_capacity_includes_every_row_and_metadata(layout_binary, shape, senders, queued):
+    values = list(map(int, subprocess.check_output(
+        [str(layout_binary), *map(str, shape), str(senders)], text=True).split()))
+    assert bool(values[9]) is queued
+    if not senders:
+        return
+    capacity, words, end = values[10:]
+    rows = shape[0] * shape[2] * shape[4]
+    assert capacity * senders >= rows > (capacity - 1) * senders
+    assert words == rows + senders * capacity + senders + 2
+    assert end == 1024 + words * 4
+    assert (end <= 1024 + shape[1] * shape[2] * 4) is queued
+
+
+@pytest.mark.parametrize('value', ['-1', '33', '1.5', '16junk', '', None, ' 16', '+16', '١٦'])
+def test_invalid_return_sender_config_fails_before_collective_allocation(value):
+    with pytest.raises(ValueError, match='DG_MEGAMOE_RDMA_RETURN_SENDERS'):
+        contract.validate_return_senders(value)
+
+
+@pytest.fixture(scope='module')
+def queue_binary(tmp_path_factory):
+    binary = tmp_path_factory.mktemp('rdma-queue') / 'queue'
+    subprocess.run(['c++', '-std=c++20', '-pthread', '-O2', '-Wall', '-Wextra',
+                    '-I', str(ROOT / 'deep_gemm/include'),
+                    str(ROOT / 'tests/rdma_return_queue_test.cpp'), '-o', str(binary)], check=True)
+    return binary
+
+
+@pytest.mark.parametrize('case', ['holes', 'concurrent', 'late'])
+def test_queue_publication_drain_and_replay(queue_binary, case):
+    subprocess.run([str(queue_binary), case], check=True, timeout=30)
 
 
 @pytest.mark.parametrize('shape', [

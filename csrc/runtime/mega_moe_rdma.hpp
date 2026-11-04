@@ -151,6 +151,9 @@ inline std::shared_ptr<deep_jit::cuda::Kernel> compile(const std::string& source
     }();
     auto options = jit->default_compiler_options;
     options.extra_nvcc_flags.emplace_back("-DDG_MEGAMOE_NVSHMEM=1");
+    const auto return_senders = deep_jit::get_env<int>("DG_MEGAMOE_RDMA_RETURN_SENDERS", 0);
+    DG_HOST_ASSERT(return_senders >= 0 and return_senders <= 32);
+    options.extra_nvcc_flags.emplace_back("-DDG_MEGAMOE_RDMA_RETURN_SENDERS=" + std::to_string(return_senders));
     const auto kernel = runtime->compile("sm100_fp8_fp4_mega_moe_rdma", source, options);
     if (not state().kernels.contains(kernel->library_handle)) {
         cudaStreamCaptureStatus capture;

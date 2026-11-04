@@ -52,6 +52,28 @@ struct MegaMoERdmaBuffer {
     DG_RDMA_HD uint32_t* return_counter(uint32_t peer, uint32_t slot, uint32_t token) const {
         return routes(0) + (peer * topk + slot) * max_tokens + token;
     }
+    DG_RDMA_HD uint64_t return_rows() const { return num_ranks * topk * max_tokens; }
+    DG_RDMA_HD uint64_t return_queue_capacity(uint32_t senders) const {
+        return (return_rows() + senders - 1) / senders;
+    }
+    DG_RDMA_HD uint64_t return_queue_words(uint32_t senders) const {
+        return return_rows() + senders * return_queue_capacity(senders) + senders + 2;
+    }
+    DG_RDMA_HD bool can_queue_returns(uint32_t senders) const {
+        return senders != 0 and return_queue_words(senders) <= num_experts * max_tokens;
+    }
+    DG_RDMA_HD uint32_t* return_queue_entries(uint32_t senders, uint32_t shard) const {
+        return routes(0) + return_rows() + shard * return_queue_capacity(senders);
+    }
+    DG_RDMA_HD uint32_t* return_queue_tail(uint32_t senders, uint32_t shard) const {
+        return return_queue_entries(senders, senders) + shard;
+    }
+    DG_RDMA_HD uint32_t* return_queue_closed(uint32_t senders) const {
+        return return_queue_tail(senders, senders);
+    }
+    DG_RDMA_HD uint32_t* return_queue_done(uint32_t senders) const {
+        return return_queue_closed(senders) + 1;
+    }
     DG_RDMA_HD void* inputs(uint32_t peer) const {
         return base + input_offset() + peer * input_bytes();
     }

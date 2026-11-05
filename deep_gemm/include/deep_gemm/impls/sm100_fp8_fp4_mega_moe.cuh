@@ -144,7 +144,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #else
     constexpr uint32_t kReturnSenders = 0;
 #endif
-    const auto transport = comm::MegaMoETransport<kNumRanks, kReturnSenders>{
+#if defined(DG_MEGAMOE_NVSHMEM) && defined(DG_MEGAMOE_RDMA_OVERLAP)
+    DG_STATIC_ASSERT(DG_MEGAMOE_RDMA_OVERLAP == 0 or DG_MEGAMOE_RDMA_OVERLAP == 1, "Invalid RDMA overlap mode");
+    constexpr bool kRdmaOverlap = DG_MEGAMOE_RDMA_OVERLAP != 0;
+#else
+    constexpr bool kRdmaOverlap = false;
+#endif
+    const auto transport = comm::MegaMoETransport<kNumRanks, kReturnSenders, kRdmaOverlap>{
         sym_buffer, buffer, layout::MegaMoERdmaBuffer(rdma_buffer, kNumRanks, kNumExperts,
                                                     kNumMaxTokensPerRank, kHidden, kNumTopk)};
 
@@ -434,10 +440,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         );
 
 #ifdef DG_MEGAMOE_NVSHMEM
-        asm volatile("fence.proxy.async.global;" ::: "memory");
+        if constexpr (not kRdmaOverlap)
+            asm volatile("fence.proxy.async.global;" ::: "memory");
 #endif
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+
+        // The overlap candidate releases shared epilogues before bulk input
+        // staging. Dispatch still waits for payload visibility before ring pulls.
+        transport.template prepare_inputs<kNumSMs, kNumDispatchThreads, kDispatchGridSyncIndex>(
+            workspace, sm_idx, thread_idx,
+            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
 
         // Pull token data and SF from remote ranks into local L1 buffer
         uint32_t pull_mbarrier_phase = 0;
@@ -1465,6 +1478,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         const auto grid_idx = transport.epoch();
+        comm::MegaMoEPeerReadiness<kNumRanks> peer_readiness;
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
@@ -1479,8 +1493,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or transport.ready(peer_ready_ptr, grid_idx)); },
-                             [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            if constexpr (kRdmaOverlap) {
+                transport.wait_selected_returns(
+                    is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : kNumRanks,
+                    lane_idx, grid_idx, peer_readiness);
+            } else {
+                comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or transport.ready(peer_ready_ptr, grid_idx)); },
+                                 [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            }
 
 #ifdef DG_MEGAMOE_NVSHMEM
             asm volatile("fence.proxy.async.global;" ::: "memory");

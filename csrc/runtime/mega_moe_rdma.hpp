@@ -154,6 +154,9 @@ inline std::shared_ptr<deep_jit::cuda::Kernel> compile(const std::string& source
     const auto return_senders = deep_jit::get_env<int>("DG_MEGAMOE_RDMA_RETURN_SENDERS", 0);
     DG_HOST_ASSERT(return_senders >= 0 and return_senders <= 32);
     options.extra_nvcc_flags.emplace_back("-DDG_MEGAMOE_RDMA_RETURN_SENDERS=" + std::to_string(return_senders));
+    const auto overlap = deep_jit::get_env<int>("DG_MEGAMOE_RDMA_OVERLAP", 0);
+    DG_HOST_ASSERT(overlap == 0 or overlap == 1);
+    options.extra_nvcc_flags.emplace_back("-DDG_MEGAMOE_RDMA_OVERLAP=" + std::to_string(overlap));
     const auto kernel = runtime->compile("sm100_fp8_fp4_mega_moe_rdma", source, options);
     if (not state().kernels.contains(kernel->library_handle)) {
         cudaStreamCaptureStatus capture;

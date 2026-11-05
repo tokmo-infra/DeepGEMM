@@ -7,7 +7,13 @@ import torch
 import torch.distributed as dist
 
 from .. import _C
-from .rdma_contract import RdmaLayout, validate_manifests, validate_peer_mappings, validate_return_senders
+from .rdma_contract import (
+    RdmaLayout,
+    validate_manifests,
+    validate_overlap,
+    validate_peer_mappings,
+    validate_return_senders,
+)
 
 _session = None
 
@@ -31,6 +37,7 @@ def allocate_buffers(group, bootstrap_group, config, native_bytes):
     error = ''
     staging_bytes = 0
     return_senders = 0
+    overlap = 0
     try:
         if ranks != bootstrap_ranks:
             raise ValueError('EP and bootstrap rank order must match')
@@ -45,6 +52,7 @@ def allocate_buffers(group, bootstrap_group, config, native_bytes):
         if os.getenv('DG_COMM_KERNEL_DEBUG', '0') != '0':
             raise ValueError('DG_COMM_KERNEL_DEBUG clears live RDMA epochs and is unsupported')
         return_senders = validate_return_senders(os.getenv('DG_MEGAMOE_RDMA_RETURN_SENDERS', '0'))
+        overlap = validate_overlap(os.getenv('DG_MEGAMOE_RDMA_OVERLAP', '0'))
         layout = RdmaLayout(group.size(), config['experts'], config['tokens'], config['hidden'], config['topk'])
         staging_bytes = layout.num_bytes
         if staging_bytes > int(os.getenv('DG_MEGAMOE_RDMA_MAX_STAGING_BYTES', str(4 << 30))):
@@ -60,7 +68,7 @@ def allocate_buffers(group, bootstrap_group, config, native_bytes):
     manifest = {
         'error': error,
         'config': (ranks, config, native_bytes, staging_bytes, _C.get_num_sms(),
-                   os.getenv('NVSHMEM_SYMMETRIC_SIZE'), os.getenv('NVSHMEM_REMOTE_TRANSPORT'), return_senders),
+                   os.getenv('NVSHMEM_SYMMETRIC_SIZE'), os.getenv('NVSHMEM_REMOTE_TRANSPORT'), return_senders, overlap),
     }
     manifests = [None] * group.size()
     dist.all_gather_object(manifests, manifest, group=bootstrap_group)

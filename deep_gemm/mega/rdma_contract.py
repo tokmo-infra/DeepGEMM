@@ -3,6 +3,13 @@
 from dataclasses import dataclass
 
 
+def validate_overlap(value):
+    """Keep the unvalidated phase-overlap candidate opt-in on every rank."""
+    if value not in ('0', '1'):
+        raise ValueError('DG_MEGAMOE_RDMA_OVERLAP must be 0 or 1')
+    return int(value)
+
+
 def validate_return_senders(value):
     """Validate the experimental queue knob before collective allocation."""
     # Match C++ from_chars, including rejecting whitespace, '+' and non-ASCII digits.

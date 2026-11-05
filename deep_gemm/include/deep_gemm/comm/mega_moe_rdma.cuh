@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deep_gemm/comm/barrier.cuh>
+#include <deep_gemm/comm/mega_moe_peer_ready.cuh>
 #include <deep_gemm/comm/mega_moe_return_queue.cuh>
 #include <deep_gemm/layout/mega_moe_rdma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
@@ -28,11 +29,17 @@ struct MegaMoEReturnQueueAtomic {
                      : "=r"(old) : "l"(ptr), "r"(value) : "memory");
         return old;
     }
+    CUTLASS_DEVICE static uint32_t compare_exchange(uint32_t* ptr, uint32_t expected, uint32_t desired) {
+        uint32_t old;
+        asm volatile("atom.acq_rel.gpu.global.cas.b32 %0, [%1], %2, %3;"
+                     : "=r"(old) : "l"(ptr), "r"(expected), "r"(desired) : "memory");
+        return old;
+    }
 };
 #endif
 
 // Only instantiated in the opt-in SM100 FP8 x MXFP4 SwiGLU kernel.
-template <uint32_t kNumRanks, uint32_t kReturnSenders = 0>
+template <uint32_t kNumRanks, uint32_t kReturnSenders = 0, bool kOverlap = false>
 struct MegaMoETransport {
     const layout::SymBuffer<kNumRanks>& sym;
     const layout::MegaMoEBuffer& buffer;
@@ -107,6 +114,40 @@ struct MegaMoETransport {
 #endif
     }
 
+    template <uint32_t kThreads, typename Sync>
+    CUTLASS_DEVICE void fetch_inputs(uint32_t sm, uint32_t thread, const Sync& sync) const {
+#ifdef DG_MEGAMOE_NVSHMEM
+        if (sm == 0 and thread < kNumRanks and remote(thread)) {
+            const auto tokens = *staging.peer_tokens(thread);
+            DG_DEVICE_ASSERT(tokens <= staging.max_tokens);
+            if (input_proxy(thread) == sym.rank_idx and tokens != 0) {
+                const auto pull = [&](const layout::Buffer& part) {
+                    auto* src = part.template get_base_ptr<uint8_t>();
+                    nvshmem_getmem_nbi(input(src, thread), src,
+                                      tokens * part.data_layout.template get_num_bytes<uint64_t>(), thread);
+                };
+                pull(buffer.input_token_buffer);
+                pull(buffer.input_sf_buffer);
+                // Streaming/queued returns use dispatch metadata, not the
+                // source top-k array. The post-grid scan fallback still needs it.
+                if (not kOverlap or not streaming_returns())
+                    pull(buffer.input_topk_idx_buffer);
+                pull(buffer.input_topk_weights_buffer);
+                nvshmem_quiet();
+            }
+        }
+        // One cache per directly accessible team; different source PEs select
+        // different owners. This also orders NIC writes before local peer reads.
+        if (sm == 0) {
+            sync();
+            if (thread == 0 and nvshmem_team_n_pes(NVSHMEM_TEAM_SHARED) > 1 and
+                nvshmem_team_n_pes(NVSHMEM_TEAM_SHARED) < kNumRanks)
+                nvshmem_barrier(NVSHMEM_TEAM_SHARED);
+            sync();
+        }
+#endif
+    }
+
     template <uint32_t kNumSMs, uint32_t kThreads, uint32_t kSync, uint32_t kTag, typename Sync>
     CUTLASS_DEVICE void barrier(const layout::Workspace& ws, uint32_t sm, uint32_t thread,
                                 const Sync& sync, bool prologue, bool epilogue) const {
@@ -125,41 +166,32 @@ struct MegaMoETransport {
         // live token prefixes. The barrier publishes peer_tokens with the data.
         if constexpr (kTag == 1) {
             sync();
+            if constexpr (kOverlap) {
+                // Use only reserved header space; neither native offsets nor
+                // allocation ABI change. This reset precedes any combine work.
+                DG_STATIC_ASSERT(kNumRanks * 12 <= 1016, "RDMA peer cache exceeds the staging header");
+                if (sm == 0 and thread < kNumRanks)
+                    *staging.peer_visible(thread) = 0;
+            }
             // The dispatch barrier has consumed the route send slab. Reuse it
             // for row completion counters until the next launch's dispatch.
-            if (sm == 0 and streaming_returns()) {
+            if ((kOverlap or sm == 0) and streaming_returns()) {
                 const auto count = queued_returns() ? staging.return_queue_words(kReturnSenders) : staging.return_rows();
-                for (uint64_t i = thread; i < count; i += kThreads)
+                // The preceding grid joins every dispatch issuer's quiet, so
+                // other CTAs can clear their source slab while CTA 0 is in the
+                // world barrier. The final grid joins all clears before returns.
+                const uint64_t first = kOverlap ? sm * kThreads + thread : thread;
+                const uint64_t stride = kOverlap ? kNumSMs * kThreads : kThreads;
+                for (uint64_t i = first; i < count; i += stride)
                     staging.routes(0)[i] = 0;
             }
-            if (sm == 0 and thread < kNumRanks and remote(thread)) {
-                const auto tokens = *staging.peer_tokens(thread);
-                DG_DEVICE_ASSERT(tokens <= staging.max_tokens);
-                if (input_proxy(thread) == sym.rank_idx and tokens != 0) {
-                    const auto pull = [&](const layout::Buffer& part) {
-                        auto* src = part.template get_base_ptr<uint8_t>();
-                        nvshmem_getmem_nbi(input(src, thread), src,
-                                          tokens * part.data_layout.template get_num_bytes<uint64_t>(), thread);
-                    };
-                    pull(buffer.input_token_buffer);
-                    pull(buffer.input_sf_buffer);
-                    pull(buffer.input_topk_idx_buffer);
-                    pull(buffer.input_topk_weights_buffer);
-                    nvshmem_quiet();
-                }
-            }
-            // One cache per directly accessible team; different source PEs
-            // select different cache owners to keep all local NICs active.
-            if (sm == 0) {
-                sync();
-                if (thread == 0 and nvshmem_team_n_pes(NVSHMEM_TEAM_SHARED) > 1 and
-                    nvshmem_team_n_pes(NVSHMEM_TEAM_SHARED) < kNumRanks)
-                    nvshmem_barrier(NVSHMEM_TEAM_SHARED);
-                sync();
-            }
+            if constexpr (not kOverlap)
+                fetch_inputs<kThreads>(sm, thread, sync);
             if (sm == 0 and thread < kNumRanks and remote(thread)) {
                 // Independent source slots avoid mixed NIC/GPU AMOs. Preserve
-                // the scheduler's kNumSMs * kNumRanks contribution count.
+                // the scheduler's kNumSMs * kNumRanks contribution count. With
+                // overlap, publish metadata before fetching activation payloads;
+                // activation TMA still waits on the original l1_full_count.
                 for (uint32_t e = 0; e < ws.num_experts_per_rank; ++e)
                     ptx::atomic_add_sys(ws.get_expert_recv_count_sum_ptr(e),
                         (static_cast<uint64_t>(kNumSMs) << 32) | *ws.get_expert_recv_count_ptr(thread, e));
@@ -170,6 +202,21 @@ struct MegaMoETransport {
 #else
         nvlink_barrier<kNumRanks, kNumSMs, kThreads, kSync, kTag>(
             ws, sym, sm, thread, sync, prologue, epilogue);
+#endif
+    }
+
+    template <uint32_t kNumSMs, uint32_t kThreads, uint32_t kSync, typename Sync>
+    CUTLASS_DEVICE void prepare_inputs(const layout::Workspace& ws, uint32_t sm,
+                                       uint32_t thread, const Sync& sync) const {
+#ifdef DG_MEGAMOE_NVSHMEM
+        if constexpr (kOverlap) {
+            // Called AFTER the dispatch/epilogue rendezvous: shared-expert
+            // epilogues and routed weight preparation may now run during GETs.
+            // Only dispatch warps wait here; do not release incomplete ring rows.
+            fetch_inputs<kThreads>(sm, thread, sync);
+            grid_sync<kNumSMs, kSync>(ws, sm, thread, sync);
+            asm volatile("fence.proxy.async.global;" ::: "memory");
+        }
 #endif
     }
 
@@ -281,6 +328,12 @@ struct MegaMoETransport {
     template <uint32_t kThreads, typename Sync>
     CUTLASS_DEVICE void return_and_signal(uint32_t thread, uint64_t epoch, const Sync& sync) const {
 #ifdef DG_MEGAMOE_NVSHMEM
+        if constexpr (kOverlap) {
+            // The existing epilogue grid already joined direct stores. Local
+            // destinations need neither the remote sender join nor NIC quiet.
+            if (thread < kNumRanks and not remote(thread))
+                ptx::st_rel_sys(sym.map(buffer.workspace.get_combine_ready_grid_idx_ptr(sym.rank_idx), thread), epoch);
+        }
         // Spread independent return rows across the epilogue CTA instead of
         // serializing every row for a destination in one GPU lane.
         for (uint32_t peer = 0; not streaming_returns() and peer < kNumRanks; ++peer) {
@@ -314,7 +367,7 @@ struct MegaMoETransport {
         if (thread < 32)
             nvshmemx_quiet_warp();
         sync();
-        if (thread < kNumRanks) {
+        if (thread < kNumRanks and (not kOverlap or remote(thread))) {
             auto* ready = buffer.workspace.get_combine_ready_grid_idx_ptr(sym.rank_idx);
             nvshmemx_signal_op(ready, epoch, NVSHMEM_SIGNAL_SET, thread);
         }
@@ -335,10 +388,47 @@ struct MegaMoETransport {
         return ptx::ld_acq_sys(ptr) == epoch;
     }
 
+    CUTLASS_DEVICE void wait_selected_returns(uint32_t peer, uint32_t lane, uint64_t epoch,
+                                              MegaMoEPeerReadiness<kNumRanks>& cache) const {
+#ifdef DG_MEGAMOE_NVSHMEM
+        // All lanes participate; kNumRanks is the sentinel for masked/shared
+        // slots. Each lane probes its own peers, once successfully per launch,
+        // instead of repeating target consistency for every token/chunk.
+        constexpr auto kGroups = MegaMoEPeerReadiness<kNumRanks>::kGroups;
+        uint32_t required[kGroups];
+        #pragma unroll
+        for (uint32_t group = 0; group < kGroups; ++group)
+            required[group] = __reduce_or_sync(0xffffffff,
+                peer < kNumRanks and peer / 32 == group ? 1u << (peer % 32) : 0u);
+        wait_until([&]() {
+            bool complete = true;
+            #pragma unroll
+            for (uint32_t group = 0; group < kGroups; ++group) {
+                const bool done = cache.poll(lane, group, required[group], [&](uint32_t source) {
+                    auto* ptr = buffer.workspace.get_combine_ready_grid_idx_ptr(source);
+                    // A plain acquire is sufficient only for mapped GPU writes.
+                    // Remote success must include NVSHMEM target consistency.
+                    if (not remote(source)) return ptx::ld_acq_sys(ptr) == epoch;
+                    return MegaMoEPeerVisibility<MegaMoEReturnQueueAtomic>::test(
+                        staging.peer_visible(source),
+                        [&]() { return ptx::ld_acq_sys(ptr) == epoch; },
+                        [&]() { return nvshmem_uint64_test(ptr, NVSHMEM_CMP_EQ, epoch) != 0; });
+                });
+                complete = complete and done;
+            }
+            return __all_sync(0xffffffff, complete);
+        }, [&]() { printf("DeepGEMM RDMA selected-peer timeout: rank=%u peer=%u\n", sym.rank_idx, peer); });
+        // Publish each successful lane's acquire to the warp before its TMA
+        // issuer executes the caller's async-proxy fence and combine loads.
+        __syncwarp();
+#endif
+    }
+
     template <uint32_t kNumSMs, uint32_t kSync, typename Sync>
     CUTLASS_DEVICE void finish_returns(const layout::Workspace& ws, uint32_t sm,
                                       uint32_t thread, const Sync& sync) const {
 #ifdef DG_MEGAMOE_NVSHMEM
+        if constexpr (kOverlap) return;
         // Each peer signals even when it has no output. A single test_all orders
         // the NIC writes before the grid release/acquire and subsequent TMA
         // fences. Per-token tests would repeat the costly target-consistency op.

@@ -35,7 +35,9 @@ int main(int argc, char** argv) {
               << reinterpret_cast<uint8_t*>(x.launch_epoch()) - header << " "
               << reinterpret_cast<uint8_t*>(x.peer_tokens(x.num_ranks)) - header << " "
               << x.can_stream_returns() << " "
-              << reinterpret_cast<uint8_t*>(x.return_counter(x.num_ranks - 1, x.topk - 1, x.max_tokens - 1) + 1) - header;
+              << reinterpret_cast<uint8_t*>(x.return_counter(x.num_ranks - 1, x.topk - 1, x.max_tokens - 1) + 1) - header << " "
+              << reinterpret_cast<uint8_t*>(x.peer_visible(0)) - header << " "
+              << reinterpret_cast<uint8_t*>(x.peer_visible(x.num_ranks)) - header;
     if (argc > 6) {
         const auto senders = std::strtoul(argv[6], nullptr, 10);
         std::cout << " " << x.can_queue_returns(senders);
@@ -66,6 +68,9 @@ def test_python_and_compiled_layout_agree_without_32bit_overflow(layout_binary, 
     epoch_offset, peer_tokens_end = values[5:7]
     assert peer_tokens_end <= epoch_offset and epoch_offset + 8 <= 1024
     assert epoch_offset % 8 == 0
+    visibility_start, visibility_end = values[9:11]
+    assert peer_tokens_end == visibility_start < visibility_end <= epoch_offset
+    assert visibility_end - visibility_start == shape[0] * 4
     assert layout.input_offset >= 1024 + layout.experts * layout.tokens * 4
     assert layout.output_offset >= layout.input_offset + layout.ranks * layout.input_bytes
     assert layout.input_offset % 128 == layout.output_offset % 128 == 0
@@ -76,7 +81,7 @@ def test_return_counters_cannot_overlap_live_input_staging(layout_binary, expert
     # Exercise the real device layout's fallback at the exact route-slab limit.
     shape = (8, experts, 1920, 5120, topk)
     values = list(map(int, subprocess.check_output([str(layout_binary), *map(str, shape)], text=True).split()))
-    can_stream, counter_end = values[7:]
+    can_stream, counter_end = values[7:9]
     assert bool(can_stream) is streaming
     assert (counter_end <= values[2]) is streaming
     if streaming:
@@ -96,10 +101,10 @@ def test_return_counters_cannot_overlap_live_input_staging(layout_binary, expert
 def test_queue_capacity_includes_every_row_and_metadata(layout_binary, shape, senders, queued):
     values = list(map(int, subprocess.check_output(
         [str(layout_binary), *map(str, shape), str(senders)], text=True).split()))
-    assert bool(values[9]) is queued
+    assert bool(values[11]) is queued
     if not senders:
         return
-    capacity, words, end = values[10:]
+    capacity, words, end = values[12:]
     rows = shape[0] * shape[2] * shape[4]
     assert capacity * senders >= rows > (capacity - 1) * senders
     assert words == rows + senders * capacity + senders + 2
@@ -111,6 +116,39 @@ def test_queue_capacity_includes_every_row_and_metadata(layout_binary, shape, se
 def test_invalid_return_sender_config_fails_before_collective_allocation(value):
     with pytest.raises(ValueError, match='DG_MEGAMOE_RDMA_RETURN_SENDERS'):
         contract.validate_return_senders(value)
+
+
+@pytest.mark.parametrize('value', ['-1', '2', '1.0', 'true', '', None, ' 1', '+1', '١', 1])
+def test_invalid_overlap_config_fails_before_collective_allocation(value):
+    with pytest.raises(ValueError, match='DG_MEGAMOE_RDMA_OVERLAP'):
+        contract.validate_overlap(value)
+
+
+def test_overlap_modes_must_agree_across_ranks():
+    baseline, candidate = (contract.validate_overlap(value) for value in ('0', '1'))
+    assert (baseline, candidate) == (0, 1)
+    with pytest.raises(ValueError, match='ranks \\[1\\] differ'):
+        contract.validate_manifests([
+            {'error': '', 'config': (8, 148, baseline)},
+            {'error': '', 'config': (8, 148, candidate)}])
+
+
+@pytest.fixture(scope='module')
+def peer_ready_binary(tmp_path_factory):
+    binary = tmp_path_factory.mktemp('rdma-peer-ready') / 'peer-ready'
+    subprocess.run(['c++', '-std=c++20', '-pthread', '-O2', '-Wall', '-Wextra', '-Werror',
+                    '-I', str(ROOT / 'deep_gemm/include'),
+                    str(ROOT / 'tests/rdma_peer_ready_test.cpp'), '-o', str(binary)], check=True)
+    return binary
+
+
+@pytest.mark.parametrize('ranks', [1, 8, 24, 33, 72, 128])
+def test_selected_peer_visibility_cache_and_epoch_reuse(peer_ready_binary, ranks):
+    subprocess.run([str(peer_ready_binary), str(ranks)], check=True, timeout=30)
+
+
+def test_one_visibility_probe_shared_across_warps_without_owner_deadlock(peer_ready_binary):
+    subprocess.run([str(peer_ready_binary), '0'], check=True, timeout=30)
 
 
 @pytest.fixture(scope='module')

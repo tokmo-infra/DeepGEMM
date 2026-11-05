@@ -40,6 +40,11 @@ struct MegaMoERdmaBuffer {
     DG_RDMA_HD uint64_t* peer_tokens(uint32_t peer) const {
         return reinterpret_cast<uint64_t*>(base) + peer;
     }
+    DG_RDMA_HD uint32_t* peer_visible(uint32_t peer) const {
+        // Per-launch GPU visibility cache, disjoint from counts and epoch.
+        // At the supported maximum EP72 its end is byte 864 (< epoch at 1016).
+        return reinterpret_cast<uint32_t*>(peer_tokens(num_ranks)) + peer;
+    }
     DG_RDMA_HD uint64_t* launch_epoch() const {
         return reinterpret_cast<uint64_t*>(base + route_offset() - sizeof(uint64_t));
     }

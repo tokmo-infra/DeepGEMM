@@ -5,12 +5,14 @@ FP8 activation / MXFP4 weight SwiGLU kernel, including FP8 shared experts.
 Both build modes and GPU kernels have been compiled on B300 with CUDA 13.0.
 Single-node tests include forced remote staging with P2P disabled. Cross-node
 EP8 (four GPUs per node) also passed exact correctness checks, with measured
-layer timings. Larger EP sizes and model serving validation remain pending.
+layer timings. EP24 synthetic correctness was subsequently exercised; model
+serving validation remains pending.
 The default remains `nvlink`.
-GPU results below describe the validated streaming baseline (`67f08c5`). The
-optional queued-return implementation described below awaits GPU validation.
+Historical GPU tables below describe the streaming baseline (`67f08c5`). The
+2026-11-05 section records the later queue experiments (`8e5b4be`). The new
+phase-overlap candidate has only CPU checks; CUDA/GPU validation is pending.
 
-## Protocol
+## Protocol (default overlap mode 0)
 
 The main symmetric allocation uses NVSHMEM. `nvshmem_ptr` determines which peers
 are directly accessible; inaccessible peers have a zero pointer and cannot pass
@@ -120,7 +122,85 @@ paths, and `DG_COMM_KERNEL_DEBUG` are unsupported in this first version.
 
 ## Validation
 
-### Queued returns: opt-in prototype, GPU validation pending
+### Phase overlap: CPU-checked candidate, CUDA/GPU validation pending
+
+Set `DG_MEGAMOE_RDMA_OVERLAP=1` to test the candidate. The default `0` retains
+the preceding protocol. Set the same value on every worker before allocation
+and warmup; restart workers when changing it. Rebuild the paired DeepGEMM
+extension, which forwards the option into the JIT cache key. Bootstrap rejects
+invalid values and cross-rank disagreement. Native NVLink ignores the option.
+It composes with `DG_MEGAMOE_RDMA_RETURN_SENDERS`; start A/B with senders `0`.
+
+The candidate changes transport dependencies, while keeping the scheduler,
+GEMM arithmetic, TMA pipeline, ring credit, shared-expert math and top-k
+reduction order:
+
+1. Dispatch RMA completion and the world barrier still precede consumption of
+   routing metadata. Remote counts are accumulated before bulk input GETs, so
+   routed task/weight preparation no longer waits for activation staging.
+2. The original dispatch/epilogue rendezvous runs after metadata and return
+   state initialization, before input GETs. Shared epilogues can progress during
+   prefetch. A separate **dispatch-only** grid rendezvous and async-proxy fence
+   still complete all input caches before any ring producer reads them. This
+   adds one dispatch grid synchronization; its cost needs measurement.
+3. Dispatch CTAs clear disjoint portions of the dead route slab after the
+   existing grid joins all route issuers' quiet calls. The metadata grid joins
+   those clears before any return producer. Streaming/queued modes skip the
+   unused top-k-ID input GET; the scan fallback still fetches it.
+4. After the existing epilogue grid joins direct output stores, mapped peers
+   receive their native release-store ready signal before the remote sender
+   join/quiet. Remote readiness still follows the full sender join and PE-wide
+   quiet. Signal completion and the cleanup rendezvous remain in place.
+5. Combine removes the all-peer `test_all` and its extra epilogue grid barrier.
+   Each warp waits only for source peers selected by its current token. Shared
+   and masked slots add no dependency. Mapped sources use native acquire;
+   remote sources require a successful NVSHMEM `test`, preserving target
+   consistency before the existing TMA async-proxy fence.
+
+Remote visibility is shared across the GPU: a per-peer state transitions from
+unknown to claimed to visible. One winning lane executes the consistency probe
+and publishes success with GPU release ordering; other readers acquire that
+publication. A failed probe releases the claim. Losing lanes return to the
+warp-wide poll without spinning inside divergence, so they cannot prevent a
+winning lane from running. A per-lane register cache then avoids repeat probes
+for later tokens/chunks in the same launch. This limits **successful remote
+consistency probes to one per required peer per receiving GPU per launch**,
+rather than one per token or warp. Failed probes can retry.
+
+The shared visibility states occupy previously unused staging-header bytes
+after peer token counts: at EP72 they end at byte 864, before the epoch at 1016.
+They reset before the dispatch metadata grid and are never reused across
+launches. Allocation sizes, native offsets and RDMA ABI 1 are unchanged.
+The retained outgoing quiet, signal completion, cleanup world barrier and
+serialized launch order still protect send slabs, input caches and epochs;
+removing the receive grid does not remove those lifetime requirements.
+
+Local checks on 2026-11-05: 56 CPU contract tests passed, including compiled
+header tests of selected/late peers, masked dependencies, repeated epochs,
+header bounds and concurrent visibility publication. The shared-cache test
+also passed ThreadSanitizer. These tests do not emulate CUDA/NIC ordering.
+This revision has **not** been CUDA compiled, run on GPUs, or benchmarked;
+no machines or GPUs were accessed during this change. Earlier compilation and
+GPU results apply to their recorded revisions, not this candidate.
+
+Remaining bottlenecks are explicit: input GETs still transfer entire live
+prefixes before routed ring pulls, return tiles still use per-row atomics,
+remote ready signals still follow a PE-wide quiet, and cleanup still has a
+world barrier. This candidate does not claim to restore all native overlap.
+The next hardware run must first compile/link both modes, then compare:
+
+- Native NVLink, local NVSHMEM and cross-node overlap `0/1`, with identical
+  shapes/seeds, GPU/NIC mappings and input hashes; primary tokens `128/512`.
+- Sender `0/8`, shared expert off/on, empty/uneven ranks, all-masked routes,
+  P2P disabled, counter/queue storage fallbacks, long changing-route graph
+  replay and ring reuse; require exact output and expert-count checks.
+- Delayed selected and unselected sources: verify unrelated peers do not gate
+  combine and the visibility claim never blocks another lane's progress.
+- Count publication, shared epilogue start, input readiness, epilogue/sender
+  completion, receive/combine and cleanup timestamps; report total layer time,
+  register/spill changes and native regression checks before enabling it.
+
+### Queued returns: opt-in experiment
 
 `DG_MEGAMOE_RDMA_RETURN_SENDERS=16` selects a sharded return queue for RDMA.
 The default `0` keeps the validated direct streaming path; values `1..32`
@@ -172,13 +252,33 @@ instruction bytes matched the preceding revision for both primary shapes.
 Queued fusion bodies reported 116 registers and no spill loads/stores; NVSHMEM
 library functions still have their own stack/spill usage. These compiler
 figures do not measure runtime register pressure or latency.
-Until hardware tests pass, keep the default `0`. Required A/B runs compare
+Keep the default `0`; the latest hardware results below do not establish a
+consistent large-batch advantage. Further A/B runs compare
 `0/8/16/32` with identical seeded inputs, 100 changing-route graph replays and
 the seven-batch timing checks below. Include queue-storage fallback, no shared
 expert, uneven/empty ranks, all-masked routes, P2P disabled, local NVSHMEM and
 native NVLink controls. Record sender start times, epilogue completion, sender
 join, quiet, register spills and end-to-end layer latency; a shorter epilogue
 alone is insufficient to establish an improvement.
+
+### 2026-11-05 queue results (before the phase-overlap candidate)
+
+DeepGEMM `8e5b4be` passed exact eager/reference checks, 100 changing-route
+graph replays and checks after every timed batch in the main EP8 and EP24
+matrix. EP8 used 55/89 with four GPUs per node; EP24 used 55/89/91 with eight
+per node. Shape: E384/K6/H5120/I2304/shared1, aligned capacity 1920.
+
+| Tokens/rank | EP8 direct ms | EP8 queue8 ms | EP24 direct ms | EP24 queue8 ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 0.658 | 0.619 | 2.065 | 2.044 |
+| 512 | 0.979 | 0.956 | 8.353 | 9.859 |
+
+EP24 and EP8's larger queued case were noisy; sender counts 16/32 regressed
+the EP8 large case. Native EP8 on node 91 measured 0.195/0.227 ms with matching
+EP8 input hashes (a different-host control). Queue8 remained about 3.17/4.22x
+slower. These are synthetic layer measurements, not model TPOT. Only the
+direct EP8 phase trace finished before testing was paused; there is no complete
+queue8 phase trace. Defaults remain unchanged, and GPU work is paused.
 
 ### CPU contract checks
 

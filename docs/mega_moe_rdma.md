@@ -9,8 +9,10 @@ layer timings. EP24 synthetic correctness was subsequently exercised; model
 serving validation remains pending.
 The default remains `nvlink`.
 Historical GPU tables below describe the streaming baseline (`67f08c5`). The
-2026-11-05 section records the later queue experiments (`8e5b4be`). The new
-phase-overlap candidate has only CPU checks; CUDA/GPU validation is pending.
+2026-11-05 section records the later queue experiments (`8e5b4be`). The
+2026-11-06 section records EP8 GPU validation of phase overlap (`2fbc8f1`),
+including native NVLink controls and phase traces. Both experiment defaults
+remain disabled; model serving validation is separate.
 
 ## Protocol (default overlap mode 0)
 
@@ -122,7 +124,7 @@ paths, and `DG_COMM_KERNEL_DEBUG` are unsupported in this first version.
 
 ## Validation
 
-### Phase overlap: CPU-checked candidate, CUDA/GPU validation pending
+### Phase overlap: EP8 GPU-checked candidate
 
 Set `DG_MEGAMOE_RDMA_OVERLAP=1` to test the candidate. The default `0` retains
 the preceding protocol. Set the same value on every worker before allocation
@@ -142,7 +144,7 @@ reduction order:
    state initialization, before input GETs. Shared epilogues can progress during
    prefetch. A separate **dispatch-only** grid rendezvous and async-proxy fence
    still complete all input caches before any ring producer reads them. This
-   adds one dispatch grid synchronization; its cost needs measurement.
+   adds one dispatch grid synchronization; the measurements below include it.
 3. Dispatch CTAs clear disjoint portions of the dead route slab after the
    existing grid joins all route issuers' quiet calls. The metadata grid joins
    those clears before any return producer. Streaming/queued modes skip the
@@ -179,26 +181,85 @@ Local checks on 2026-11-05: 56 CPU contract tests passed, including compiled
 header tests of selected/late peers, masked dependencies, repeated epochs,
 header bounds and concurrent visibility publication. The shared-cache test
 also passed ThreadSanitizer. These tests do not emulate CUDA/NIC ordering.
-This revision has **not** been CUDA compiled, run on GPUs, or benchmarked;
-no machines or GPUs were accessed during this change. Earlier compilation and
-GPU results apply to their recorded revisions, not this candidate.
+That implementation turn did not access machines or GPUs. Subsequent CUDA
+compilation and GPU measurements of the same code are recorded below.
 
 Remaining bottlenecks are explicit: input GETs still transfer entire live
 prefixes before routed ring pulls, return tiles still use per-row atomics,
 remote ready signals still follow a PE-wide quiet, and cleanup still has a
 world barrier. This candidate does not claim to restore all native overlap.
-The next hardware run must first compile/link both modes, then compare:
+Remaining validation includes deliberate delayed/failed source injection,
+extended-duration replay/ring reuse, EP16/EP24 on this revision, and model
+evaluation with end-to-end TPOT/throughput. The CPU owner-progress test does
+not substitute for GPU scheduling/fault injection.
 
-- Native NVLink, local NVSHMEM and cross-node overlap `0/1`, with identical
-  shapes/seeds, GPU/NIC mappings and input hashes; primary tokens `128/512`.
-- Sender `0/8`, shared expert off/on, empty/uneven ranks, all-masked routes,
-  P2P disabled, counter/queue storage fallbacks, long changing-route graph
-  replay and ring reuse; require exact output and expert-count checks.
-- Delayed selected and unselected sources: verify unrelated peers do not gate
-  combine and the visibility claim never blocks another lane's progress.
-- Count publication, shared epilogue start, input readiness, epilogue/sender
-  completion, receive/combine and cleanup timestamps; report total layer time,
-  register/spill changes and native regression checks before enabling it.
+### 2026-11-06 phase-overlap results
+
+Tested kernel source: `2fbc8f13298633cd73bf8288dc4d8c9c46a25e6a`, with a newly
+built host extension and JIT CUDA compile/device link. B300 EP8 used nodes
+55/89 with four GPUs per node; native controls used all eight GPUs on either
+55 or 91. Shape: E384/K6/H5120/I2304/shared1, clamp10, capacity1920. Every
+comparison used matching per-rank input hashes and GPU NIC handlers on all
+NVSHMEM workers. Timing: 20 calls/graph, three warmup graphs, seven batches;
+the table reports the median of per-batch maximum-rank average layer times.
+
+| Transport / mode | 128 tokens/rank, us | 512 tokens/rank, us |
+| --- | ---: | ---: |
+| Native NVLink, node 55 | 190.432 | 224.557 |
+| Native NVLink, node 91 | 195.110 | 227.995 |
+| Cross-node overlap0, sender0 | 657.683 | 977.282 |
+| Cross-node overlap1, sender0 | 652.493 | 976.245 |
+| Cross-node overlap0, sender8 | 619.618 | 959.754 |
+| Cross-node overlap1, sender8 | 607.706 | 924.978 |
+
+Overlap alone reduced these medians by only **0.79% / 0.11%**: no material
+layer-speed improvement. With sender8, the additional reduction was
+**1.92% / 3.62%**. Repeating the 512-token sender8 pair in reversed mode order
+gave overlap0 **943.160 us** and overlap1 **923.198 us**, a **2.12%** reduction.
+The batch ranges overlap substantially (initial pair 916.776–1009.691 versus
+883.590–944.014 us; repeat 906.698–1007.619 versus 888.984–960.776 us), so do not
+treat the larger-batch percentage as a precise or universal gain.
+The best combination remains about **3.19x / 4.12x** the node-55 NVLink time.
+Local node-91 NVSHMEM at 512 tokens measured **254.106 / 251.272 us** with
+overlap0/1 and direct returns. This is a layer benchmark, not model TPOT.
+
+All eight main cross-node cases and both repeated cases passed 100
+changing-route graph replays, exact output/expert-count checks and checks
+after every timed batch. Each native/local control passed 20 replays and the
+same timing checks. Additional overlap1 checks passed 20 replays each:
+single-node EP8 with P2P disabled; cross-node 89/91 with an empty rank and 50%
+masked routes; all-masked routes with shared experts disabled; counter-only
+fallback (E32/K4); and scan fallback (E32/K5). The cross-node boundary cases
+requested sender8, exercising composition with overlap and both fallbacks.
+
+Phase traces compare direct-return overlap0/1 at 512 tokens: 140 invocations
+per rank and 148 CTAs, using only GPU-local timestamp differences. The first
+epilogue tile became ready **185–194 us earlier**, with about 143 CTAs per GPU
+reaching it before the remote input cache was ready, versus none in overlap0.
+Thus the shared-expert overlap was restored in the measured execution.
+However, live-prefix input preparation still took **203–214 us**, and the
+remaining routed compute/epilogue pipeline still took **521–538 us**, including
+waits. Cleanup finished **57–69 us after the last combine CTA** in overlap1.
+Earlier combine work therefore did not shorten the kernel's critical tail.
+
+Removing the all-peer receive gate also moves selected-peer waits into
+combine; a near-zero dedicated receive-gate interval is not evidence that
+network waiting disappeared. Instrumented medians were 1025.690/1026.941 us,
+versus adjacent uninstrumented controls of 1019.354/1016.262 us (0.62%/1.05%
+difference). These shorter-correctness-run controls are separate from the
+main 100-replay matrix. Temporary trace headers were restored and SHA-256
+checked before the final stock runs. No kernel code changed during validation.
+
+The build logs also expose an existing compilation limitation: ptxas reports
+`C7504`, stating that `setmaxnreg` is ignored for compatibility across
+compilation units. Keeping the source-level warp register budgets therefore
+does not establish preservation of native dynamic register redistribution in
+the RDC/NVSHMEM build. Stock fused-function resource reports at block M128
+were 121/128 registers for direct overlap0/1, with a 528-byte stack in both;
+native reported 128 registers and a 96-byte stack. These static reports do not
+measure spill traffic or attribute the cross-node slowdown. Local NVSHMEM is
+only about 12% slower than native at 512 tokens, so the compiler warning alone
+is not evidence that fixing it would recover the entire cross-node gap.
 
 ### Queued returns: opt-in experiment
 
@@ -212,8 +273,9 @@ allocation agreement and JIT cache key. Native NVLink ignores it.
 
 Each selected CTA's first dispatch warp becomes a sender only after finishing
 all its original input pulls. No extra CTA, warp, shared-memory allocation or
-SM reservation is introduced. GEMM/TMA scheduling, ring credits, register
-budgets, shared-expert computation and top-k reduction order are unchanged.
+SM reservation is introduced. GEMM/TMA scheduling, ring credits, source-level
+register budgets, shared-expert computation and top-k reduction order are
+unchanged. See the compilation limitation above for actual register behavior.
 The last tile of a remote row publishes a descriptor with release ordering;
 the epilogue never waits for a sender or calls NVSHMEM to submit that row.
 Senders acquire descriptors and submit complete BF16 rows while remaining
